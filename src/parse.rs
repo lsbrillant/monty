@@ -238,6 +238,7 @@ fn parse_expression(expression: AstExpr) -> ParseResult<ParseExpr> {
     }
 }
 
+#[allow(dead_code)]
 fn parse_kwargs(kwarg: Keyword) -> ParseResult<(String, ParseExpr)> {
     let key = match kwarg.node.arg {
         Some(key) => key,

@@ -55,6 +55,7 @@ pub(crate) enum Expr<T, Funcs> {
         op: CmpOperator,
         right: Box<Expr<T, Funcs>>,
     },
+    #[allow(dead_code)]
     List(Vec<Expr<T, Funcs>>),
 }
 
@@ -253,14 +254,6 @@ impl Value {
             Self::List(v) => Some(!v.is_empty()),
             Self::Tuple(v) => Some(!v.is_empty()),
             Self::Range(v) => Some(*v != 0),
-        }
-    }
-
-    pub fn invert(&self) -> Option<Value> {
-        match self {
-            Self::True => Some(Self::False),
-            Self::False => Some(Self::True),
-            _ => None,
         }
     }
 

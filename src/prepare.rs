@@ -1,7 +1,7 @@
 use ahash::AHashMap;
 use std::borrow::Cow;
 
-use crate::types::{Builtins, Expr, Node};
+use crate::types::{Builtins, Expr, Node, Value};
 
 pub(crate) type PrepareResult<T> = Result<T, Cow<'static, str>>;
 
@@ -10,11 +10,12 @@ pub(crate) type RunExpr = Expr<usize, Builtins>;
 
 /// TODO:
 /// * pre-calculate const expressions
-/// * const assignment as new type?
-pub(crate) fn prepare(nodes: Vec<Node<String, String>>) -> PrepareResult<(usize, Vec<RunNode>)> {
+/// * const assignment add directly to namespace
+pub(crate) fn prepare(nodes: Vec<Node<String, String>>) -> PrepareResult<(Vec<Value>, Vec<RunNode>)> {
     let mut namespace = Namespace::new(nodes.len());
     let new_nodes = prepare_nodes(nodes, &mut namespace)?;
-    Ok((namespace.names_count, new_nodes))
+    let initial_namespace = vec![Value::Undefined; namespace.names_count];
+    Ok((initial_namespace, new_nodes))
 }
 
 fn prepare_nodes(nodes: Vec<Node<String, String>>, namespace: &mut Namespace) -> PrepareResult<Vec<RunNode>> {

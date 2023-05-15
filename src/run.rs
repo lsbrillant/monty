@@ -5,24 +5,19 @@ use crate::types::{Builtins, CmpOperator, Expr, Node, Operator, Value};
 
 pub type RunResult<T> = Result<T, Cow<'static, str>>;
 
-pub(crate) fn run(namespace_size: usize, nodes: &[RunNode]) -> RunResult<()> {
-    let mut frame = Frame::new(namespace_size);
-    frame.execute(nodes)
-}
-
 #[derive(Debug)]
-struct Frame {
+pub(crate) struct Frame {
     namespace: Vec<Value>,
 }
 
 impl Frame {
-    fn new(namespace_size: usize) -> Self {
+    pub fn new(namespace: Vec<Value>) -> Self {
         Self {
-            namespace: vec![Value::Undefined; namespace_size],
+            namespace,
         }
     }
 
-    fn execute(&mut self, nodes: &[RunNode]) -> RunResult<()> {
+    pub fn execute(&mut self, nodes: &[RunNode]) -> RunResult<()> {
         for node in nodes {
             self.execute_node(node)?;
         }
