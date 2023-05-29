@@ -1,8 +1,8 @@
-use crate::evaluate::Evaluator;
 use std::borrow::Cow;
 
+use crate::evaluate::Evaluator;
 use crate::object::Object;
-use crate::types::{Expr, ExprLoc, Identifier, Node, Operator};
+use crate::types::{Exit, Expr, ExprLoc, Identifier, Node, Operator};
 
 pub type RunResult<T> = Result<T, Cow<'static, str>>;
 
@@ -16,19 +16,24 @@ impl Frame {
         Self { namespace }
     }
 
-    pub fn execute(&mut self, nodes: &[Node]) -> RunResult<()> {
+    pub fn execute(&mut self, nodes: &[Node]) -> RunResult<Exit> {
         for node in nodes {
-            self.execute_node(node)?;
+            match self.execute_node(node)? {
+                Some(leave) => return Ok(leave),
+                None => (),
+            }
         }
-        Ok(())
+        Ok(Exit::ReturnNone)
     }
 
-    fn execute_node(&mut self, node: &Node) -> RunResult<()> {
+    fn execute_node(&mut self, node: &Node) -> RunResult<Option<Exit>> {
         match node {
             Node::Pass => return Err("Unexpected `pass` in execution".into()),
             Node::Expr(expr) => {
                 self.execute_expr(expr)?;
             }
+            Node::Return(expr) => return Ok(Some(Exit::Return(self.execute_expr(expr)?.into_owned()))),
+            Node::ReturnNone => return Ok(Some(Exit::ReturnNone)),
             Node::Assign { target, object } => {
                 self.assign(target, object)?;
             }
@@ -43,11 +48,11 @@ impl Frame {
             } => self.for_loop(target, iter, body, or_else)?,
             Node::If { test, body, or_else } => self.if_(test, body, or_else)?,
         };
-        Ok(())
+        Ok(None)
     }
 
     fn execute_expr<'a>(&'a self, expr: &'a ExprLoc) -> RunResult<Cow<Object>> {
-        // TODO, does creating this struct harm performance, or is it optimised out?
+        // TODO: does creating this struct harm performance, or is it optimised out?
         Evaluator::new(&self.namespace).evaluate(expr)
     }
 
@@ -72,7 +77,11 @@ impl Frame {
             };
             match ok {
                 true => Ok(()),
-                false => Err(format!("({}) Cannot apply assign operator {op:?} {:?}", object.position, object.expr).into()),
+                false => Err(format!(
+                    "({}) Cannot apply assign operator {op:?} {:?}",
+                    object.position, object.expr
+                )
+                .into()),
             }
         } else {
             Err(format!("name '{}' is not defined", target.name).into())

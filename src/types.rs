@@ -135,10 +135,7 @@ impl fmt::Display for ExprLoc {
 
 impl ExprLoc {
     pub fn new(position: CodeRange, expr: Expr) -> Self {
-        Self {
-            position,
-            expr,
-        }
+        Self { position, expr }
     }
 }
 
@@ -241,6 +238,10 @@ impl Expr {
         matches!(self, Self::Constant(_))
     }
 
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::Constant(Object::None))
+    }
+
     pub fn into_object(self) -> Object {
         match self {
             Self::Constant(object) => object,
@@ -253,6 +254,8 @@ impl Expr {
 pub(crate) enum Node {
     Pass,
     Expr(ExprLoc),
+    Return(ExprLoc),
+    ReturnNone,
     Assign {
         target: Identifier,
         object: ExprLoc,
@@ -310,4 +313,12 @@ impl Builtins {
             _ => false,
         }
     }
+}
+
+#[derive(Debug)]
+pub enum Exit {
+    ReturnNone,
+    Return(Object),
+    // Yield(Object),
+    // Raise(Object),
 }

@@ -19,7 +19,9 @@ impl<'a> Evaluator<'a> {
             Expr::Name(ident) => {
                 if let Some(object) = self.namespace.get(ident.id) {
                     match object {
-                        Object::Undefined => Err(format!("({}) name '{}' is not defined", expr_loc.position, ident.name).into()),
+                        Object::Undefined => {
+                            Err(format!("({}) name '{}' is not defined", expr_loc.position, ident.name).into())
+                        }
                         _ => Ok(Cow::Borrowed(object)),
                     }
                 } else {
@@ -57,7 +59,11 @@ impl<'a> Evaluator<'a> {
         };
         match op_object {
             Some(object) => Ok(Cow::Owned(object)),
-            None => Err(format!("({}) Cannot apply operator {left} {op} {right}", left.position.extend(&right.position)).into()),
+            None => Err(format!(
+                "({}) Cannot apply operator {left} {op} {right}",
+                left.position.extend(&right.position)
+            )
+            .into()),
         }
     }
 
@@ -75,7 +81,11 @@ impl<'a> Evaluator<'a> {
         };
         match op_object {
             Some(object) => Ok(object),
-            None => Err(format!("({}) Cannot apply comparison operator {left} {op} {right}", left.position.extend(&right.position)).into()),
+            None => Err(format!(
+                "({}) Cannot apply comparison operator {left} {op} {right}",
+                left.position.extend(&right.position)
+            )
+            .into()),
         }
     }
 

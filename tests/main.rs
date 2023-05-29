@@ -1,6 +1,5 @@
+use monty::{Executor, Exit};
 use serde::Deserialize;
-use monty::parse_show;
-
 
 #[derive(Debug, Deserialize)]
 struct Case {
@@ -14,13 +13,16 @@ struct Cases {
 }
 
 #[test]
-fn test_syntax() {
-    let cases: Cases = toml::from_str(include_str!("syntax-cases.toml")).unwrap();
-    dbg!(&cases.cases);
+fn test_return() {
+    let cases: Cases = toml::from_str(include_str!("return-cases.toml")).unwrap();
+    // dbg!(&cases.cases);
     for case in cases.cases {
-        let output = parse_show(&case.code, "test.py").unwrap();
+        let ex = Executor::new(&case.code, "test.py", &[]).unwrap();
+        let output = match ex.run(vec![]) {
+            Ok(Exit::Return(value)) => format!("{:?}", value),
+            otherwise => panic!("Unexpected exit: {:?}", otherwise),
+        };
         let expected = case.expected.trim_matches('\n');
-        // eprintln!("output: {}", output);
         assert_eq!(output, expected);
     }
 }

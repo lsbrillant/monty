@@ -63,7 +63,10 @@ impl Parser {
                 body: _,
                 decorator_list: _,
             } => Err("TODO ClassDef".into()),
-            StmtKind::Return { value: _ } => Err("TODO Return".into()),
+            StmtKind::Return { value } => match value {
+                Some(value) => Ok(Node::Return(self.parse_expression(*value)?)),
+                None => Ok(Node::ReturnNone),
+            },
             StmtKind::Delete { targets: _ } => Err("TODO Delete".into()),
             StmtKind::Assign { targets, value, .. } => self.parse_assignment(first(targets)?, *value),
             StmtKind::AugAssign { target, op, value } => Ok(Node::OpAssign {
@@ -229,7 +232,10 @@ impl Parser {
                     .into_iter()
                     .map(|f| self.parse_kwargs(f))
                     .collect::<ParseResult<_>>()?;
-                Ok(ExprLoc::new(self.convert_range(&range), Expr::Call { func, args, kwargs }))
+                Ok(ExprLoc::new(
+                    self.convert_range(&range),
+                    Expr::Call { func, args, kwargs },
+                ))
             }
             ExprKind::FormattedValue {
                 value: _,
@@ -237,7 +243,10 @@ impl Parser {
                 format_spec: _,
             } => Err("TODO FormattedValue".into()),
             ExprKind::JoinedStr { values: _ } => Err("TODO JoinedStr".into()),
-            ExprKind::Constant { value, .. } => Ok(ExprLoc::new(self.convert_range(&range), Expr::Constant(convert_const(value)?))),
+            ExprKind::Constant { value, .. } => Ok(ExprLoc::new(
+                self.convert_range(&range),
+                Expr::Constant(convert_const(value)?),
+            )),
             ExprKind::Attribute {
                 value: _,
                 attr: _,
@@ -249,7 +258,10 @@ impl Parser {
                 ctx: _,
             } => Err("TODO Subscript".into()),
             ExprKind::Starred { value: _, ctx: _ } => Err("TODO Starred".into()),
-            ExprKind::Name { id, .. } => Ok(ExprLoc::new(self.convert_range(&range), Expr::Name(Identifier::from_name(id)))),
+            ExprKind::Name { id, .. } => Ok(ExprLoc::new(
+                self.convert_range(&range),
+                Expr::Name(Identifier::from_name(id)),
+            )),
             ExprKind::List { elts: _, ctx: _ } => Err("TODO List".into()),
             ExprKind::Tuple { elts: _, ctx: _ } => Err("TODO Tuple".into()),
             ExprKind::Slice {

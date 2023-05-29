@@ -30,9 +30,10 @@ fn main() -> ExitCode {
 
     let tic = Instant::now();
     match ex.run(inputs) {
-        Ok(_) => {
+        Ok(exit) => {
             let toc = Instant::now();
             eprintln!("Elapsed time: {:?}", toc - tic);
+            println!("Exit: {:?}", exit);
             ExitCode::SUCCESS
         }
         Err(err) => {

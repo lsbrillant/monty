@@ -1,6 +1,7 @@
-use ahash::AHashMap;
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
+
+use ahash::AHashMap;
 
 use crate::evaluate::Evaluator;
 use crate::object::Object;
@@ -11,7 +12,7 @@ pub(crate) type PrepareResult<T> = Result<T, Cow<'static, str>>;
 /// TODO:
 /// * check variables exist before pre-assigning
 pub(crate) fn prepare(nodes: Vec<Node>, input_names: &[&str]) -> PrepareResult<(Vec<Object>, Vec<Node>)> {
-    let mut p = Prepare::new(nodes.len(), input_names);
+    let mut p = Prepare::new(nodes.len(), input_names, true);
     let new_nodes = p.prepare_nodes(nodes)?;
     Ok((p.namespace, new_nodes))
 }
@@ -20,10 +21,12 @@ struct Prepare {
     name_map: AHashMap<String, usize>,
     namespace: Vec<Object>,
     consts: Vec<bool>,
+    /// Root frame is the outer frame of the script, e.g. the "global" scope
+    root_frame: bool,
 }
 
 impl Prepare {
-    fn new(capacity: usize, input_names: &[&str]) -> Self {
+    fn new(capacity: usize, input_names: &[&str], root_frame: bool) -> Self {
         let mut name_map = AHashMap::with_capacity(capacity);
         for (index, name) in input_names.iter().enumerate() {
             name_map.insert(name.to_string(), index);
@@ -34,18 +37,30 @@ impl Prepare {
             name_map,
             namespace,
             consts,
+            root_frame,
         }
     }
 
     fn prepare_nodes(&mut self, nodes: Vec<Node>) -> PrepareResult<Vec<Node>> {
-        let mut new_nodes = Vec::with_capacity(nodes.len());
-        for node in nodes {
+        let nodes_len = nodes.len();
+        let mut new_nodes = Vec::with_capacity(nodes_len);
+        for (index, node) in nodes.into_iter().enumerate() {
             match node {
                 Node::Pass => (),
                 Node::Expr(expr) => {
                     let expr = self.prepare_expression(expr)?;
-                    new_nodes.push(Node::Expr(expr));
+                    // if we're in the root frame, and the expr is the last node, and it's not None, return it
+                    if self.root_frame && index == nodes_len - 1 && !expr.expr.is_none() {
+                        new_nodes.push(Node::Return(expr));
+                    } else {
+                        new_nodes.push(Node::Expr(expr));
+                    }
                 }
+                Node::Return(expr) => {
+                    let expr = self.prepare_expression(expr)?;
+                    new_nodes.push(Node::Return(expr));
+                }
+                Node::ReturnNone => new_nodes.push(Node::ReturnNone),
                 Node::Assign { target, object } => {
                     let object = self.prepare_expression(object)?;
                     let (target, is_new) = self.get_id(target);

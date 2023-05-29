@@ -9,6 +9,7 @@ pub use crate::object::Object;
 use crate::parse::{parse, ParseResult};
 use crate::prepare::prepare;
 use crate::run::{Frame, RunResult};
+pub use crate::types::Exit;
 use crate::types::Node;
 
 pub struct Executor {
@@ -28,7 +29,7 @@ impl Executor {
         })
     }
 
-    pub fn run(&self, inputs: Vec<Object>) -> RunResult<()> {
+    pub fn run(&self, inputs: Vec<Object>) -> RunResult<Exit> {
         let mut namespace = self.initial_namespace.clone();
         for (i, input) in inputs.into_iter().enumerate() {
             namespace[i] = input;
@@ -36,7 +37,6 @@ impl Executor {
         Frame::new(namespace).execute(&self.nodes)
     }
 }
-
 
 /// parse code and show the parsed AST, mostly for testing
 pub fn parse_show(code: &str, filename: &str) -> Result<String, String> {

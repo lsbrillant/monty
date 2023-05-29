@@ -1,0 +1,17 @@
+[[cases]]
+code = "1 + 1"
+expected = "Int(2)"
+
+[[cases]]
+code = "'a' + 'b'"
+expected = 'Str("ab")'
+
+[[cases]]
+code = """
+v = ''
+for i in range(1000):
+    if i % 13 == 0:
+        v += 'x'
+len(v)
+"""
+expected = "Int(77)"
