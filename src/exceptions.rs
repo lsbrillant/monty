@@ -41,7 +41,7 @@ impl Exception {
         }
     }
 
-    pub(crate) fn with_position(self, position: &CodeRange) -> ExceptionRaise {
+    pub(crate) fn with_position(self, position: CodeRange) -> ExceptionRaise {
         ExceptionRaise {
             exc: self,
             frame: Some(StackFrame::from_position(position)),
@@ -70,13 +70,13 @@ macro_rules! exc_err {
 pub(crate) use exc_err;
 
 #[derive(Debug, Clone)]
-pub struct ExceptionRaise {
+pub struct ExceptionRaise<'a> {
     pub(crate) exc: Exception,
     // first in vec is closes "bottom" frame
-    pub(crate) frame: Option<StackFrame>,
+    pub(crate) frame: Option<StackFrame<'a>>,
 }
 
-impl fmt::Display for ExceptionRaise {
+impl<'a> fmt::Display for ExceptionRaise<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(ref frame) = self.frame {
             writeln!(f, "Traceback (most recent call last):")?;
@@ -86,41 +86,41 @@ impl fmt::Display for ExceptionRaise {
     }
 }
 
-impl From<Exception> for ExceptionRaise {
+impl<'a> From<Exception> for ExceptionRaise<'a> {
     fn from(exc: Exception) -> Self {
         ExceptionRaise { exc, frame: None }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct StackFrame {
-    pub(crate) position: CodeRange,
-    pub(crate) frame_name: Option<Cow<'static, str>>,
-    pub(crate) parent: Option<Box<StackFrame>>,
+pub struct StackFrame<'a> {
+    pub(crate) position: CodeRange<'a>,  // TODO should be a reference
+    pub(crate) frame_name: Option<&'a str>,
+    pub(crate) parent: Option<Box<StackFrame<'a>>>,
 }
 
-impl fmt::Display for StackFrame {
+impl<'a> fmt::Display for StackFrame<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(ref parent) = self.parent {
             write!(f, "{}", parent)?;
         }
 
-        self.position.traceback(f, self.frame_name.as_ref())
+        self.position.traceback(f, self.frame_name)
     }
 }
 
-impl StackFrame {
-    pub(crate) fn new(position: &CodeRange, frame_name: &Cow<'static, str>, parent: &Option<StackFrame>) -> Self {
+impl<'a> StackFrame<'a> {
+    pub(crate) fn new(position: &CodeRange<'a>, frame_name: &'a str, parent: &Option<StackFrame<'a>>) -> Self {
         Self {
             position: position.clone(),
-            frame_name: Some(frame_name.clone()),
+            frame_name: Some(frame_name),
             parent: parent.clone().map(|s| Box::new(s)),
         }
     }
 
-    fn from_position(position: &CodeRange) -> Self {
+    fn from_position(position: CodeRange<'a>) -> Self {
         Self {
-            position: position.clone(),
+            position,
             frame_name: None,
             parent: None,
         }
@@ -149,12 +149,12 @@ impl fmt::Display for InternalRunError {
 }
 
 #[derive(Debug, Clone)]
-pub enum RunError {
+pub enum RunError<'a> {
     Internal(InternalRunError),
-    Exc(ExceptionRaise),
+    Exc(ExceptionRaise<'a>),
 }
 
-impl fmt::Display for RunError {
+impl<'a> fmt::Display for RunError<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Internal(s) => write!(f, "{s}"),
@@ -163,19 +163,19 @@ impl fmt::Display for RunError {
     }
 }
 
-impl From<InternalRunError> for RunError {
+impl<'a> From<InternalRunError> for RunError<'a> {
     fn from(internal_error: InternalRunError) -> Self {
         Self::Internal(internal_error)
     }
 }
 
-impl From<ExceptionRaise> for RunError {
-    fn from(exc: ExceptionRaise) -> Self {
+impl<'a> From<ExceptionRaise<'a>> for RunError<'a> {
+    fn from(exc: ExceptionRaise<'a>) -> Self {
         Self::Exc(exc)
     }
 }
 
-impl From<Exception> for RunError {
+impl<'a> From<Exception> for RunError<'a> {
     fn from(exc: Exception) -> Self {
         Self::Exc(exc.into())
     }

@@ -17,13 +17,13 @@ pub use crate::types::Exit;
 use crate::types::Node;
 
 #[derive(Debug)]
-pub struct Executor {
+pub struct Executor<'a> {
     initial_namespace: Vec<Object>,
-    nodes: Vec<Node>,
+    nodes: Vec<Node<'a>>,
 }
 
-impl Executor {
-    pub fn new(code: &str, filename: &str, input_names: &[&str]) -> ParseResult<Self> {
+impl<'a> Executor<'a> {
+    pub fn new(code: &'a str, filename: &'a str, input_names: &[&str]) -> ParseResult<'a, Self> {
         let nodes = parse(code, filename)?;
         // dbg!(&nodes);
         let (initial_namespace, nodes) = prepare(nodes, input_names)?;
@@ -42,7 +42,10 @@ impl Executor {
         match RunFrame::new(namespace).execute(&self.nodes) {
             Ok(v) => Ok(v),
             Err(e) => match e {
-                RunError::Exc(exc) => Ok(Exit::Raise(exc)),
+                RunError::Exc(exc) => {
+                    // Ok(Exit::Raise(exc))
+                    todo!("Exception: {}", exc);
+                },
                 RunError::Internal(internal) => Err(internal),
             },
         }

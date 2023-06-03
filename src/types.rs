@@ -81,20 +81,20 @@ impl fmt::Display for CmpOperator {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExprLoc {
-    pub position: CodeRange,
-    pub expr: Expr,
+pub(crate) struct ExprLoc<'a> {
+    pub position: CodeRange<'a>,
+    pub expr: Expr<'a>,
 }
 
-impl fmt::Display for ExprLoc {
+impl<'a> fmt::Display for ExprLoc<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // don't show position as that should be displayed separately
         write!(f, "{}", self.expr)
     }
 }
 
-impl ExprLoc {
-    pub fn new(position: CodeRange, expr: Expr) -> Self {
+impl<'a> ExprLoc<'a> {
+    pub fn new(position: CodeRange<'a>, expr: Expr<'a>) -> Self {
         Self { position, expr }
     }
 }
@@ -113,9 +113,9 @@ impl Identifier {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Kwarg {
+pub(crate) struct Kwarg<'a> {
     pub key: Identifier,
-    pub value: ExprLoc,
+    pub value: ExprLoc<'a>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,29 +144,29 @@ impl Function {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum Expr {
+pub(crate) enum Expr<'a> {
     Constant(Object),
     Name(Identifier),
     Call {
         func: Function,
-        args: Vec<ExprLoc>,
-        kwargs: Vec<Kwarg>,
+        args: Vec<ExprLoc<'a>>,
+        kwargs: Vec<Kwarg<'a>>,
     },
     Op {
-        left: Box<ExprLoc>,
+        left: Box<ExprLoc<'a>>,
         op: Operator,
-        right: Box<ExprLoc>,
+        right: Box<ExprLoc<'a>>,
     },
     CmpOp {
-        left: Box<ExprLoc>,
+        left: Box<ExprLoc<'a>>,
         op: CmpOperator,
-        right: Box<ExprLoc>,
+        right: Box<ExprLoc<'a>>,
     },
     #[allow(dead_code)]
-    List(Vec<ExprLoc>),
+    List(Vec<ExprLoc<'a>>),
 }
 
-impl fmt::Display for Expr {
+impl<'a> fmt::Display for Expr<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Constant(object) => write!(f, "{}", object.repr()),
@@ -194,7 +194,7 @@ impl fmt::Display for Expr {
     }
 }
 
-impl Expr {
+impl<'a> Expr<'a> {
     pub fn is_const(&self) -> bool {
         matches!(self, Self::Constant(_))
     }
@@ -214,30 +214,30 @@ impl Expr {
 // TODO need a new AssignTo (enum of identifier, tuple) type used for "Assign" and "For"
 
 #[derive(Debug, Clone)]
-pub(crate) enum Node {
+pub(crate) enum Node<'a> {
     Pass,
-    Expr(ExprLoc),
-    Return(ExprLoc),
+    Expr(ExprLoc<'a>),
+    Return(ExprLoc<'a>),
     ReturnNone,
     Assign {
         target: Identifier,
-        object: ExprLoc,
+        object: ExprLoc<'a>,
     },
     OpAssign {
         target: Identifier,
         op: Operator,
-        object: ExprLoc,
+        object: ExprLoc<'a>,
     },
     For {
         target: Identifier,
-        iter: ExprLoc,
-        body: Vec<Node>,
-        or_else: Vec<Node>,
+        iter: ExprLoc<'a>,
+        body: Vec<Node<'a>>,
+        or_else: Vec<Node<'a>>,
     },
     If {
-        test: ExprLoc,
-        body: Vec<Node>,
-        or_else: Vec<Node>,
+        test: ExprLoc<'a>,
+        body: Vec<Node<'a>>,
+        or_else: Vec<Node<'a>>,
     },
 }
 
@@ -260,7 +260,7 @@ impl fmt::Display for Builtins {
 }
 
 impl Builtins {
-    pub fn find(name: &str) -> ParseResult<Self> {
+    pub fn find(name: &str) -> ParseResult<'static, Self> {
         match name {
             "print" => Ok(Self::Print),
             "range" => Ok(Self::Range),
@@ -283,7 +283,7 @@ pub enum Exit {
     ReturnNone,
     Return(Object),
     // Yield(Object),
-    Raise(ExceptionRaise),
+    // Raise(ExceptionRaise),
 }
 
 impl fmt::Display for Exit {
@@ -291,7 +291,7 @@ impl fmt::Display for Exit {
         match self {
             Self::ReturnNone => write!(f, "None"),
             Self::Return(v) => write!(f, "{}", v),
-            Self::Raise(exc) => write!(f, "{}", exc),
+            // Self::Raise(exc) => write!(f, "{}", exc),
         }
     }
 }

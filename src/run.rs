@@ -6,25 +6,25 @@ use crate::object::Object;
 use crate::parse::CodeRange;
 use crate::types::{Exit, ExprLoc, Identifier, Node, Operator};
 
-pub type RunResult<T> = Result<T, RunError>;
+pub type RunResult<'a, T> = Result<T, RunError<'a>>;
 
 #[derive(Debug)]
-pub(crate) struct RunFrame {
+pub(crate) struct RunFrame<'a> {
     namespace: Vec<Object>,
-    parent: Option<StackFrame>,
-    name: Cow<'static, str>,
+    parent: Option<StackFrame<'a>>,
+    name: &'a str,
 }
 
-impl RunFrame {
+impl<'a> RunFrame<'a> {
     pub fn new(namespace: Vec<Object>) -> Self {
         Self {
             namespace,
             parent: None,
-            name: "<module>".into(),
+            name: "<module>",
         }
     }
 
-    pub fn execute(&mut self, nodes: &[Node]) -> RunResult<Exit> {
+    pub fn execute(&mut self, nodes: &[Node<'a>]) -> RunResult<'a, Exit> {
         for node in nodes {
             match self.execute_node(node)? {
                 Some(leave) => return Ok(leave),
@@ -34,7 +34,7 @@ impl RunFrame {
         Ok(Exit::ReturnNone)
     }
 
-    fn execute_node(&mut self, node: &Node) -> RunResult<Option<Exit>> {
+    fn execute_node(&mut self, node: &'_ Node<'a>) -> RunResult<'a, Option<Exit>> {
         match node {
             Node::Pass => return exc_err!(InternalRunError::Error; "Unexpected `pass` in execution"),
             Node::Expr(expr) => {
@@ -59,25 +59,33 @@ impl RunFrame {
         Ok(None)
     }
 
-    fn execute_expr<'a>(&'a self, expr: &'a ExprLoc) -> RunResult<Cow<Object>> {
+    fn execute_expr<'o>(&'o self, expr: &'o ExprLoc<'a>) -> RunResult<'a, Cow<'o, Object>> {
         // TODO: does creating this struct harm performance, or is it optimised out?
-        Evaluator::new(&self.namespace)
-            .evaluate(expr)
-            .map_err(|e| self.set_name(e))
+        match Evaluator::new(&self.namespace).evaluate(expr) {
+            Ok(object) => Ok(object),
+            Err(mut e) => {
+                self.set_name(&mut e);
+                Err(e)
+            },
+        }
     }
 
-    fn execute_expr_bool(&self, expr: &ExprLoc) -> RunResult<bool> {
-        Evaluator::new(&self.namespace)
-            .evaluate_bool(expr)
-            .map_err(|e| self.set_name(e))
+    fn execute_expr_bool(&self, expr: &ExprLoc<'a>) -> RunResult<'a, bool> {
+        match Evaluator::new(&self.namespace).evaluate_bool(expr) {
+            Ok(object) => Ok(object),
+            Err(mut e) => {
+                self.set_name(&mut e);
+                Err(e)
+            },
+        }
     }
 
-    fn assign(&mut self, target: &Identifier, object: &ExprLoc) -> RunResult<()> {
+    fn assign(&mut self, target: &Identifier, object: &ExprLoc<'a>) -> RunResult<'a, ()> {
         self.namespace[target.id] = self.execute_expr(&object)?.into_owned();
         Ok(())
     }
 
-    fn op_assign(&mut self, target: &Identifier, op: &Operator, object: &ExprLoc) -> RunResult<()> {
+    fn op_assign(&mut self, target: &Identifier, op: &Operator, object: &ExprLoc<'a>) -> RunResult<'a, ()> {
         let right_object = self.execute_expr(&object)?.into_owned();
         if let Some(target_object) = self.namespace.get_mut(target.id) {
             let r = match op {
@@ -98,7 +106,7 @@ impl RunFrame {
         }
     }
 
-    fn for_loop(&mut self, target: &Identifier, iter: &ExprLoc, body: &[Node], _or_else: &[Node]) -> RunResult<()> {
+    fn for_loop(&mut self, target: &Identifier, iter: &ExprLoc<'a>, body: &[Node<'a>], _or_else: &[Node<'a>]) -> RunResult<'a, ()> {
         let range_size = match self.execute_expr(iter)?.as_ref() {
             Object::Range(s) => *s,
             _ => return exc_err!(InternalRunError::TodoError; "`for` iter must be a range"),
@@ -111,7 +119,7 @@ impl RunFrame {
         Ok(())
     }
 
-    fn if_(&mut self, test: &ExprLoc, body: &[Node], or_else: &[Node]) -> RunResult<()> {
+    fn if_<'o>(&mut self, test: &'o ExprLoc<'a>, body: &'o [Node<'a>], or_else: &'o [Node<'a>]) -> RunResult<'a, ()> {
         if self.execute_expr_bool(test)? {
             self.execute(body)?;
         } else {
@@ -120,16 +128,15 @@ impl RunFrame {
         Ok(())
     }
 
-    fn stack_frame(&self, position: &CodeRange) -> StackFrame {
-        StackFrame::new(position, &self.name, &self.parent)
+    fn stack_frame(&self, position: &CodeRange<'a>) -> StackFrame<'a> {
+        StackFrame::new(position, self.name, &self.parent)
     }
 
-    fn set_name(&self, mut error: RunError) -> RunError {
+    fn set_name(&self, error: &mut RunError<'a>) {
         if let RunError::Exc(ref mut exc) = error {
             if let Some(ref mut stack_frame) = exc.frame {
-                stack_frame.frame_name = Some(self.name.clone());
+                stack_frame.frame_name = Some(self.name);
             }
         }
-        error
     }
 }

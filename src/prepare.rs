@@ -10,7 +10,7 @@ use crate::types::{Builtins, Expr, ExprLoc, Function, Identifier, Kwarg, Node};
 
 /// TODO:
 /// * check variables exist before pre-assigning
-pub(crate) fn prepare(nodes: Vec<Node>, input_names: &[&str]) -> ParseResult<(Vec<Object>, Vec<Node>)> {
+pub(crate) fn prepare<'a>(nodes: Vec<Node<'a>>, input_names: &[&str]) -> ParseResult<'a, (Vec<Object>, Vec<Node<'a>>)> {
     let mut p = Prepare::new(nodes.len(), input_names, true);
     let new_nodes = p.prepare_nodes(nodes)?;
     Ok((p.namespace, new_nodes))
@@ -40,7 +40,7 @@ impl Prepare {
         }
     }
 
-    fn prepare_nodes(&mut self, nodes: Vec<Node>) -> ParseResult<Vec<Node>> {
+    fn prepare_nodes<'a>(&mut self, nodes: Vec<Node<'a>>) -> ParseResult<'a, Vec<Node<'a>>> {
         let nodes_len = nodes.len();
         let mut new_nodes = Vec::with_capacity(nodes_len);
         for (index, node) in nodes.into_iter().enumerate() {
@@ -108,7 +108,7 @@ impl Prepare {
         Ok(new_nodes)
     }
 
-    fn prepare_expression(&mut self, loc_expr: ExprLoc) -> ParseResult<ExprLoc> {
+    fn prepare_expression<'a>(&mut self, loc_expr: ExprLoc<'a>) -> ParseResult<'a, ExprLoc<'a>> {
         let ExprLoc { position, expr } = loc_expr;
         let expr = match expr {
             Expr::Constant(object) => Expr::Constant(object),
@@ -168,7 +168,7 @@ impl Prepare {
         }
     }
 
-    fn prepare_kwarg(&mut self, kwarg: Kwarg) -> ParseResult<Kwarg> {
+    fn prepare_kwarg<'a>(&mut self, kwarg: Kwarg<'a>) -> ParseResult<'a, Kwarg<'a>> {
         let Kwarg { key, value } = kwarg;
         let value = self.prepare_expression(value)?;
         // WARNING: we're not setting the id on key here, this needs doing when we implement kwargs

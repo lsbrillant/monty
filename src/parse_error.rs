@@ -3,15 +3,15 @@ use std::borrow::Cow;
 use std::fmt;
 
 #[derive(Debug, Clone)]
-pub enum ParseError {
-    Todo(&'static str),
+pub enum ParseError<'a> {
+    Todo(&'a str),
     Parsing(String),
-    Internal(Cow<'static, str>),
-    PreEvalExc(ExceptionRaise),
+    Internal(Cow<'a, str>),
+    PreEvalExc(ExceptionRaise<'a>),
     PreEvalInternal(InternalRunError),
 }
 
-impl fmt::Display for ParseError {
+impl<'a> fmt::Display for ParseError<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Todo(s) => write!(f, "TODO: {s}"),
@@ -23,8 +23,9 @@ impl fmt::Display for ParseError {
     }
 }
 
-impl ParseError {
-    pub(crate) fn pre_eval(run_error: RunError) -> Self {
+// TODO change to From
+impl<'a> ParseError<'a> {
+    pub(crate) fn pre_eval(run_error: RunError<'a>) -> Self {
         match run_error {
             RunError::Exc(e) => Self::PreEvalExc(e),
             RunError::Internal(e) => Self::PreEvalInternal(e),
@@ -32,9 +33,9 @@ impl ParseError {
     }
 }
 
-pub type ParseResult<T> = Result<T, ParseError>;
+pub type ParseResult<'a, T> = Result<T, ParseError<'a>>;
 
-impl From<InternalRunError> for ParseError {
+impl<'a> From<InternalRunError> for ParseError<'a> {
     fn from(internal_run_error: InternalRunError) -> Self {
         Self::PreEvalInternal(internal_run_error)
     }
