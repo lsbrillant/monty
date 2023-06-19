@@ -44,7 +44,7 @@ impl Types {
             "TypeError" => Ok(Self::Exceptions(ExcType::TypeError)),
             "NameError" => Ok(Self::Exceptions(ExcType::NameError)),
             "range" => Ok(Self::Range),
-            _ => Err(ParseError::Internal(format!("unknown builtin: {name}").into())),
+            _ => Err(ParseError::Internal(format!("unknown builtin: `{name}`").into())),
         }
     }
 

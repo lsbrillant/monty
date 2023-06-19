@@ -7,7 +7,7 @@ use rustpython_parser::ast::{
 use rustpython_parser::parse_program;
 
 use crate::expressions::{Expr, ExprLoc, Function, Identifier, Kwarg, Node};
-use crate::object::Object;
+use crate::object::{Attr, Object};
 use crate::operators::{CmpOperator, Operator};
 use crate::parse_error::{ParseError, ParseResult};
 
@@ -230,7 +230,6 @@ impl<'c> Parser<'c> {
                 },
             )),
             ExprKind::Call { func, args, keywords } => {
-                let func = Function::Ident(self.parse_identifier(*func)?);
                 let args = args
                     .into_iter()
                     .map(|f| self.parse_expression(f))
@@ -239,10 +238,30 @@ impl<'c> Parser<'c> {
                     .into_iter()
                     .map(|f| self.parse_kwargs(f))
                     .collect::<ParseResult<_>>()?;
-                Ok(ExprLoc::new(
-                    self.convert_range(&range),
-                    Expr::Call { func, args, kwargs },
-                ))
+                let position = self.convert_range(&range);
+                match func.node {
+                    ExprKind::Name { id, .. } => {
+                        let func = Identifier::from_name(id, self.convert_range(&func.range));
+                        let func = Function::Ident(func);
+                        Ok(ExprLoc::new(position, Expr::Call { func, args, kwargs }))
+                    }
+                    ExprKind::Attribute { value, attr, ctx: _ } => {
+                        let object = self.parse_identifier(*value)?;
+                        let attr = Attr::find(&attr)?;
+                        Ok(ExprLoc::new(
+                            position,
+                            Expr::AttrCall {
+                                object,
+                                attr,
+                                args,
+                                kwargs,
+                            },
+                        ))
+                    }
+                    _ => Err(ParseError::Internal(
+                        format!("Expected name or attribute, got {:?}", func.node).into(),
+                    )),
+                }
             }
             ExprKind::FormattedValue {
                 value: _,
@@ -269,7 +288,15 @@ impl<'c> Parser<'c> {
                 self.convert_range(&range),
                 Expr::Name(Identifier::from_name(id, self.convert_range(&expression.range))),
             )),
-            ExprKind::List { elts: _, ctx: _ } => Err(ParseError::Todo("List")),
+            // TODO what is ctx here?
+            ExprKind::List { elts, ctx: _ } => {
+                let items = elts
+                    .into_iter()
+                    .map(|f| self.parse_expression(f))
+                    .collect::<ParseResult<_>>()?;
+
+                Ok(ExprLoc::new(self.convert_range(&range), Expr::List(items)))
+            }
             ExprKind::Tuple { elts: _, ctx: _ } => Err(ParseError::Todo("Tuple")),
             ExprKind::Slice {
                 lower: _,

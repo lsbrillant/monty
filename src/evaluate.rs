@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 
 use crate::exceptions::{internal_err, ExcType, Exception, InternalRunError};
-use crate::expressions::{Expr, ExprLoc, Function, Kwarg};
-use crate::object::Object;
+use crate::expressions::{Expr, ExprLoc, Function, Identifier, Kwarg};
+use crate::object::{Attr, Object};
 use crate::operators::{CmpOperator, Operator};
 use crate::run::RunResult;
 
@@ -33,6 +33,13 @@ impl<'d> Evaluator<'d> {
                 }
             }
             Expr::Call { func, args, kwargs } => Ok(self.call_function(func, args, kwargs)?),
+            Expr::AttrCall {
+                object,
+                attr,
+                args,
+                kwargs,
+            } => Ok(self.attr_call(expr_loc, object, attr, args, kwargs)?),
+            // Expr::AttrCall { .. } => todo!(),
             Expr::Op { left, op, right } => self.op(left, op, right),
             Expr::CmpOp { left, op, right } => Ok(Cow::Owned(self.cmp_op(left, op, right)?.into())),
             Expr::List(elements) => {
@@ -103,5 +110,29 @@ impl<'d> Evaluator<'d> {
             }
         };
         builtin.call_function(self, args, kwargs)
+    }
+
+    fn attr_call<'c>(
+        &self,
+        expr_loc: &'d ExprLoc<'c>,
+        object_ident: &Identifier<'c>,
+        attr: &Attr,
+        args: &'d [ExprLoc<'c>],
+        _kwargs: &'d [Kwarg],
+    ) -> RunResult<'c, Cow<'d, Object>> {
+        let object = if let Some(object) = self.namespace.get(object_ident.id) {
+            match object {
+                Object::Undefined => return Err(InternalRunError::Undefined(object_ident.name.clone().into()).into()),
+                _ => object,
+            }
+        } else {
+            let name = object_ident.name.clone();
+
+            return Err(Exception::new(name, ExcType::NameError)
+                .with_position(expr_loc.position)
+                .into());
+        };
+        let args: Vec<Cow<Object>> = args.iter().map(|a| self.evaluate(a)).collect::<RunResult<_>>()?;
+        object.attr_call(attr, args)
     }
 }

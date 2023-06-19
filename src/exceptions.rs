@@ -12,6 +12,7 @@ pub enum ExcType {
     ValueError,
     TypeError,
     NameError,
+    AttributeError,
 }
 
 impl fmt::Display for ExcType {
@@ -22,11 +23,13 @@ impl fmt::Display for ExcType {
 }
 
 impl ExcType {
+    // TODO replace with a strum
     fn str(&self) -> &'static str {
         match self {
             Self::ValueError => "ValueError",
             Self::TypeError => "TypeError",
             Self::NameError => "NameError",
+            Self::AttributeError => "AttributeError",
         }
     }
 }

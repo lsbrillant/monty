@@ -33,6 +33,12 @@ impl<'c> From<RunError<'c>> for ParseError<'c> {
     }
 }
 
+impl<'c> From<ExceptionRaise<'c>> for ParseError<'c> {
+    fn from(exc: ExceptionRaise<'c>) -> Self {
+        Self::PreEvalExc(exc)
+    }
+}
+
 impl<'c> From<InternalRunError> for ParseError<'c> {
     fn from(internal_run_error: InternalRunError) -> Self {
         Self::PreEvalInternal(internal_run_error)

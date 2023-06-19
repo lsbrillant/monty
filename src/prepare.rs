@@ -3,7 +3,7 @@ use std::collections::hash_map::Entry;
 use ahash::AHashMap;
 
 use crate::evaluate::Evaluator;
-use crate::exceptions::internal_err;
+use crate::exceptions::{internal_err, ExcType, Exception, ExceptionRaise};
 use crate::expressions::{Expr, ExprLoc, Function, Identifier, Kwarg, Node};
 use crate::object::Object;
 use crate::object_types::Types;
@@ -72,7 +72,6 @@ impl Prepare {
                             match expr.expr {
                                 Expr::Name(id) => {
                                     // this is raising an exception type, e.g. `raise TypeError`
-                                    // TODO we need a proper type system here
                                     let expr = Expr::Call {
                                         func: Function::Builtin(Types::find(&id.name)?),
                                         args: vec![],
@@ -161,16 +160,26 @@ impl Prepare {
                     }
                 };
                 let func = Function::Builtin(Types::find(&ident.name)?);
-                Expr::Call {
-                    func,
-                    args: args
-                        .into_iter()
-                        .map(|e| self.prepare_expression(e))
-                        .collect::<ParseResult<_>>()?,
-                    kwargs: kwargs
-                        .into_iter()
-                        .map(|kwarg| self.prepare_kwarg(kwarg))
-                        .collect::<ParseResult<_>>()?,
+                let (args, kwargs) = self.get_args_kwargs(args, kwargs)?;
+                Expr::Call { func, args, kwargs }
+            }
+            Expr::AttrCall {
+                object,
+                attr,
+                args,
+                kwargs,
+            } => {
+                let (object, is_new) = self.get_id(object);
+                if is_new {
+                    let exc: ExceptionRaise = Exception::new(object.name, ExcType::NameError).into();
+                    return Err(exc.into());
+                }
+                let (args, kwargs) = self.get_args_kwargs(args, kwargs)?;
+                Expr::AttrCall {
+                    object,
+                    attr,
+                    args,
+                    kwargs,
                 }
             }
             Expr::List(elements) => {
@@ -255,6 +264,22 @@ impl Prepare {
             is_new,
         )
     }
+
+    fn get_args_kwargs<'c>(
+        &mut self,
+        args: Vec<ExprLoc<'c>>,
+        kwargs: Vec<Kwarg<'c>>,
+    ) -> ParseResult<'c, (Vec<ExprLoc<'c>>, Vec<Kwarg<'c>>)> {
+        let args = args
+            .into_iter()
+            .map(|e| self.prepare_expression(e))
+            .collect::<ParseResult<_>>()?;
+        let kwargs = kwargs
+            .into_iter()
+            .map(|kwarg| self.prepare_kwarg(kwarg))
+            .collect::<ParseResult<_>>()?;
+        Ok((args, kwargs))
+    }
 }
 
 /// whether an expression can be evaluated to a constant
@@ -270,6 +295,7 @@ fn can_be_const(expr: &Expr, consts: Option<&[bool]>) -> bool {
                 && args.iter().all(|arg| can_be_const(&arg.expr, consts))
                 && kwargs.iter().all(|kwarg| can_be_const(&kwarg.value.expr, consts))
         }
+        Expr::AttrCall { .. } => false,
         Expr::Op { left, op: _, right } => can_be_const(&left.expr, consts) && can_be_const(&right.expr, consts),
         Expr::CmpOp { left, op: _, right } => can_be_const(&left.expr, consts) && can_be_const(&right.expr, consts),
         Expr::List(elements) => elements.iter().all(|el| can_be_const(&el.expr, consts)),

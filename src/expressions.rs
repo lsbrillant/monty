@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::exceptions::ExceptionRaise;
 
-use crate::object::Object;
+use crate::object::{Attr, Object};
 use crate::object_types::Types;
 use crate::operators::{CmpOperator, Operator};
 use crate::parse::CodeRange;
@@ -29,6 +29,7 @@ pub(crate) struct Kwarg<'c> {
 #[derive(Debug, Clone)]
 pub(crate) enum Function<'c> {
     Builtin(Types),
+    // TODO can we remove Ident here and thereby Function?
     Ident(Identifier<'c>),
 }
 
@@ -60,6 +61,12 @@ pub(crate) enum Expr<'c> {
         args: Vec<ExprLoc<'c>>,
         kwargs: Vec<Kwarg<'c>>,
     },
+    AttrCall {
+        object: Identifier<'c>,
+        attr: Attr,
+        args: Vec<ExprLoc<'c>>,
+        kwargs: Vec<Kwarg<'c>>,
+    },
     Op {
         left: Box<ExprLoc<'c>>,
         op: Operator,
@@ -79,15 +86,15 @@ impl<'c> fmt::Display for Expr<'c> {
         match self {
             Self::Constant(object) => write!(f, "{}", object.repr()),
             Self::Name(identifier) => write!(f, "{}", identifier.name),
-            Self::Call { func, args, kwargs } => {
-                write!(f, "{func}(")?;
-                for arg in args.iter() {
-                    write!(f, "{arg}, ")?;
-                }
-                for kwarg in kwargs.iter() {
-                    write!(f, "{}={}, ", kwarg.key.name, kwarg.value)?;
-                }
-                write!(f, ")")
+            Self::Call { func, args, kwargs } => self.print_args(f, func, args, kwargs),
+            Self::AttrCall {
+                object,
+                attr,
+                args,
+                kwargs,
+            } => {
+                write!(f, "{}.", object.name)?;
+                self.print_args(f, attr, args, kwargs)
             }
             Self::Op { left, op, right } => write!(f, "{left} {op} {right}"),
             Self::CmpOp { left, op, right } => write!(f, "{left} {op} {right}"),
@@ -116,6 +123,39 @@ impl<'c> Expr<'c> {
             Self::Constant(object) => object,
             _ => panic!("into_const can only be called on Constant expression."),
         }
+    }
+
+    fn print_args(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        func: impl fmt::Display,
+        args: &[ExprLoc<'c>],
+        kwargs: &[Kwarg<'c>],
+    ) -> fmt::Result {
+        write!(f, "{func}(")?;
+        let mut pos_args = false;
+        for (index, arg) in args.iter().enumerate() {
+            if index == 0 {
+                write!(f, "{arg}")?;
+            } else {
+                write!(f, ", {arg}")?;
+            }
+            pos_args = true;
+        }
+        if pos_args {
+            for kwarg in kwargs.iter() {
+                write!(f, ", {}={}", kwarg.key.name, kwarg.value)?;
+            }
+        } else {
+            for (index, kwarg) in kwargs.iter().enumerate() {
+                if index == 0 {
+                    write!(f, "{}={}", kwarg.key.name, kwarg.value)?;
+                } else {
+                    write!(f, ", {}={}", kwarg.key.name, kwarg.value)?;
+                }
+            }
+        }
+        write!(f, ")")
     }
 }
 

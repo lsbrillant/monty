@@ -1,8 +1,10 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 
-use crate::exceptions::{exc_err, ExcType, Exception, RunError};
+use crate::exceptions::{exc_err, ExcType, Exception};
 use crate::run::RunResult;
+use crate::{ParseError, ParseResult};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Object {
@@ -194,13 +196,13 @@ impl Object {
         // TODO these need to match python escaping
         match self {
             Self::Str(v) => format!("'{v}'"),
-            Self::Bytes(v) => format!("b\"{v:?}\""),
+            Self::Bytes(v) => format!("b'{v:?}'"),
             Self::Exc(exc) => exc.repr(),
             _ => self.to_string(),
         }
     }
 
-    /// replace with TryFrom
+    /// TODO maybe replace with TryFrom
     pub fn as_int(&self) -> RunResult<'static, i64> {
         match self {
             Self::Int(i) => Ok(*i),
@@ -227,15 +229,28 @@ impl Object {
             Self::Exc(e) => e.type_str(),
         }
     }
-}
 
-impl TryFrom<Object> for String {
-    type Error = RunError<'static>;
-
-    fn try_from(object: Object) -> RunResult<'static, Self> {
-        match object {
-            Object::Str(s) => Ok(s),
-            _ => exc_err!(ExcType::TypeError; "'{object:?}' object is not a str"),
+    pub(crate) fn attr_call<'c, 'd>(&self, attr: &Attr, _args: Vec<Cow<'d, Self>>) -> RunResult<'c, Cow<'d, Object>> {
+        match (self, attr) {
+            (Self::List(v), Attr::Foobar) => Ok(Cow::Owned(Object::Int(v.len() as i64))),
+            // (Self::List(v), Attr::Append) => {
+            //     if args.len() != 1 {
+            //         exc_err!(ExcType::TypeError; "{attr} takes exactly exactly one argument ({} given)", args.len())
+            //     } else {
+            //         v.push(args[0].clone().into_owned());
+            //         Ok(Cow::Owned(Self::None))
+            //     }
+            // }
+            // (Self::List(v), Attr::Insert) => {
+            //     if args.len() != 2 {
+            //         exc_err!(ExcType::TypeError; "{attr} expected 2 arguments, got {}", args.len())
+            //     } else {
+            //         let index = args[0].as_int()? as usize;
+            //         v.insert(index, args[1].clone().into_owned());
+            //         Ok(Cow::Owned(Self::None))
+            //     }
+            // }
+            (s, _) => exc_err!(ExcType::AttributeError; "'{}' object has no attribute '{attr}'", s.type_str()),
         }
     }
 }
@@ -250,5 +265,35 @@ fn vecs_equal(v1: &[Object], v2: &[Object]) -> bool {
             }
         }
         true
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum Attr {
+    Append,
+    Insert,
+    Foobar,
+}
+
+impl fmt::Display for Attr {
+    // TODO replace with a strum
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Append => write!(f, "append"),
+            Self::Insert => write!(f, "insert"),
+            Self::Foobar => write!(f, "foobar"),
+        }
+    }
+}
+
+impl Attr {
+    // TODO replace with a strum
+    pub fn find(name: &str) -> ParseResult<'static, Self> {
+        match name {
+            "append" => Ok(Self::Append),
+            "insert" => Ok(Self::Insert),
+            "foobar" => Ok(Self::Foobar),
+            _ => Err(ParseError::Internal(format!("unknown attribute: `{name}`").into())),
+        }
     }
 }
