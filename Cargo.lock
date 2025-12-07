@@ -648,6 +648,8 @@ checksum = "0ad4bb2b565bca0645f4d68c5c9af97fba094e9791da685bf83cb5f3ce74acf2"
 dependencies = [
  "equivalent",
  "hashbrown",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -859,6 +861,8 @@ dependencies = [
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_text_size",
+ "serde",
+ "serde_json",
  "smallvec",
  "strum",
  "strum_macros",

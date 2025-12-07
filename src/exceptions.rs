@@ -3,6 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 
+use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::args::ArgValues;
@@ -21,7 +22,7 @@ use crate::Heap;
 /// Uses strum derives for automatic `Display`, `FromStr`, and `Into<&'static str>` implementations.
 /// The string representation matches the variant name exactly (e.g., `ValueError` -> "ValueError").
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone, Copy, PartialEq, Hash, Display, EnumString, IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Display, EnumString, IntoStaticStr, Serialize, Deserialize)]
 pub enum ExcType {
     AssertionError,
     ValueError,

@@ -15,7 +15,8 @@ repos:
     rev: v2.3.0
     hooks:
       - id: codespell
-        args: ["--ignore-words-list", "crate,NotIn"]
+        additional_dependencies:
+          - tomli
 
   - repo: local
     hooks:

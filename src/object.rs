@@ -4,6 +4,9 @@ use std::{
 };
 
 use indexmap::IndexMap;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     exceptions::{ExcType, SimpleException},
@@ -37,6 +40,26 @@ use crate::{
 ///
 /// Only immutable variants (`None`, `Ellipsis`, `Bool`, `Int`, `Float`, `String`, `Bytes`)
 /// implement `Hash`. Attempting to hash mutable variants (`List`, `Dict`) will panic.
+///
+/// # JSON Serialization
+///
+/// `PyObject` supports JSON serialization with natural mappings:
+///
+/// **Bidirectional (can serialize and deserialize):**
+/// - `None` ↔ JSON `null`
+/// - `Bool` ↔ JSON `true`/`false`
+/// - `Int` ↔ JSON integer
+/// - `Float` ↔ JSON float
+/// - `String` ↔ JSON string
+/// - `List` ↔ JSON array
+/// - `Dict` ↔ JSON object (keys must be strings)
+///
+/// **Output-only (serialize only, cannot deserialize from JSON):**
+/// - `Ellipsis` → `{"$ellipsis": true}`
+/// - `Tuple` → `{"$tuple": [...]}`
+/// - `Bytes` → `{"$bytes": [...]}`
+/// - `Exception` → `{"$exception": {"type": "...", "arg": "..."}}`
+/// - `Repr` → `{"$repr": "..."}`
 #[derive(Debug, Clone)]
 pub enum PyObject {
     /// Python's `Ellipsis` singleton (`...`).
@@ -493,5 +516,183 @@ impl TryFrom<&PyObject> for bool {
             PyObject::Bool(b) => Ok(*b),
             _ => Err(ConversionError::new("bool", value.type_name())),
         }
+    }
+}
+
+/// Custom JSON serialization for `PyObject`.
+///
+/// Serializes Python values to natural JSON representations where possible.
+/// Output-only types (Ellipsis, Tuple, Bytes, Exception, Repr) use tagged objects.
+impl Serialize for PyObject {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::None => serializer.serialize_none(),
+            Self::Bool(b) => serializer.serialize_bool(*b),
+            Self::Int(i) => serializer.serialize_i64(*i),
+            Self::Float(f) => serializer.serialize_f64(*f),
+            Self::String(s) => serializer.serialize_str(s),
+            Self::List(items) => items.serialize(serializer),
+            Self::Dict(map) => {
+                // Serialize as JSON object with string keys
+                let mut map_ser = serializer.serialize_map(Some(map.len()))?;
+                for (k, v) in map {
+                    // Extract string key or convert to repr for non-string keys
+                    let key_str = match k {
+                        Self::String(s) => s.clone(),
+                        other => other.py_repr(),
+                    };
+                    map_ser.serialize_entry(&key_str, v)?;
+                }
+                map_ser.end()
+            }
+            // Output-only types use tagged format
+            Self::Ellipsis => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("$ellipsis", &true)?;
+                map.end()
+            }
+            Self::Tuple(items) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("$tuple", items)?;
+                map.end()
+            }
+            Self::Bytes(bytes) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("$bytes", bytes)?;
+                map.end()
+            }
+            Self::Exception { exc_type, arg } => {
+                #[derive(Serialize)]
+                struct ExcData<'a> {
+                    r#type: &'a str,
+                    arg: &'a Option<String>,
+                }
+                let mut map = serializer.serialize_map(Some(1))?;
+                let type_str: &'static str = exc_type.into();
+                map.serialize_entry("$exception", &ExcData { r#type: type_str, arg })?;
+                map.end()
+            }
+            Self::Repr(s) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("$repr", s)?;
+                map.end()
+            }
+        }
+    }
+}
+
+/// Custom JSON deserialization for `PyObject`.
+///
+/// Deserializes natural JSON values to Python types:
+/// - `null` → `None`
+/// - `true`/`false` → `Bool`
+/// - integers → `Int`
+/// - floats → `Float`
+/// - strings → `String`
+/// - arrays → `List`
+/// - objects → `Dict` (keys become `String` variants)
+///
+/// Note: Tuple, Bytes, Exception, Ellipsis, and Repr cannot be deserialized from JSON.
+impl<'de> Deserialize<'de> for PyObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(PyObjectVisitor)
+    }
+}
+
+/// Visitor for deserializing JSON into `PyObject`.
+struct PyObjectVisitor;
+
+impl<'de> Visitor<'de> for PyObjectVisitor {
+    type Value = PyObject;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON value (null, bool, number, string, array, or object)")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(PyObject::None)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(PyObject::None)
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(PyObject::Bool(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(PyObject::Int(v))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        // Convert to i64 if possible, otherwise error
+        i64::try_from(v)
+            .map(PyObject::Int)
+            .map_err(|_| de::Error::custom(format!("integer {v} is too large for i64")))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(PyObject::Float(v))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(PyObject::String(v.to_owned()))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(PyObject::String(v))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(PyObject::List(items))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut dict = IndexMap::new();
+        while let Some((key, value)) = map.next_entry::<String, PyObject>()? {
+            dict.insert(PyObject::String(key), value);
+        }
+        Ok(PyObject::Dict(dict))
     }
 }
