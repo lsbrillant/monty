@@ -1,2 +1,2 @@
 1 + 2j
-# ParseError=TODO: complex constants
+# ParseError=Exc: (<no-tb>) NotImplementedError('The monty syntax parser does not yet support complex constants')

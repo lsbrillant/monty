@@ -79,8 +79,27 @@ pub(crate) fn parse<'c>(code: &'c str, filename: &'c str) -> Result<Vec<ParseNod
             let module = parsed.into_syntax();
             Parser::new(code, filename).parse_statements(module.body)
         }
-        Err(e) => Err(ParseError::Parsing(e.to_string())),
+        Err(e) => Err(syntax_error(e.to_string())),
     }
+}
+
+/// Creates a ParseError for an unimplemented Python feature.
+///
+/// Returns a `ParseError::PreEvalExc` containing a `NotImplementedError` exception.
+fn not_implemented<'c>(feature: &str) -> ParseError<'c> {
+    use crate::exceptions::ExceptionRaise;
+    let exc: ExceptionRaise<'c> = ExcType::not_implemented(feature).into();
+    exc.into()
+}
+
+/// Creates a ParseError for a syntax error.
+///
+/// Returns a `ParseError::PreEvalExc` containing a `SyntaxError` exception.
+fn syntax_error<'c>(message: String) -> ParseError<'c> {
+    use crate::exceptions::{exc_fmt, ExceptionRaise, SimpleException};
+    let exc: SimpleException<'c> = exc_fmt!(ExcType::SyntaxError; "{}", message);
+    let raise: ExceptionRaise<'c> = exc.into();
+    raise.into()
 }
 
 pub(crate) struct Parser<'c> {
@@ -132,18 +151,18 @@ impl<'c> Parser<'c> {
         match statement {
             Stmt::FunctionDef(function) => {
                 if function.is_async {
-                    return Err(ParseError::Todo("AsyncFunctionDef"));
+                    return Err(not_implemented("async function definitions"));
                 }
 
                 // Reject unsupported features
                 if function.parameters.vararg.is_some() {
-                    return Err(ParseError::Todo("*args"));
+                    return Err(not_implemented("*args (variadic positional arguments)"));
                 } else if function.parameters.kwarg.is_some() {
-                    return Err(ParseError::Todo("**kwargs"));
+                    return Err(not_implemented("**kwargs (variadic keyword arguments)"));
                 } else if !function.parameters.kwonlyargs.is_empty() {
-                    return Err(ParseError::Todo("keyword-only arguments"));
+                    return Err(not_implemented("keyword-only arguments"));
                 } else if !function.parameters.posonlyargs.is_empty() {
-                    return Err(ParseError::Todo("positional-only arguments"));
+                    return Err(not_implemented("positional-only arguments"));
                 }
 
                 // Parse parameters - only positional without defaults
@@ -151,7 +170,7 @@ impl<'c> Parser<'c> {
                 for param in &function.parameters.args {
                     // Reject default argument values
                     if param.default.is_some() {
-                        return Err(ParseError::Todo("default argument values"));
+                        return Err(not_implemented("default argument values"));
                     }
                     params.push(&self.code[param.parameter.name.range]);
                 }
@@ -162,13 +181,13 @@ impl<'c> Parser<'c> {
 
                 Ok(ParseNode::FunctionDef { name, params, body })
             }
-            Stmt::ClassDef(_) => Err(ParseError::Todo("ClassDef")),
+            Stmt::ClassDef(_) => Err(not_implemented("class definitions")),
             Stmt::Return(ast::StmtReturn { value, .. }) => match value {
                 Some(value) => Ok(ParseNode::Return(self.parse_expression(*value)?)),
                 None => Ok(ParseNode::ReturnNone),
             },
-            Stmt::Delete(_) => Err(ParseError::Todo("Delete")),
-            Stmt::TypeAlias(_) => Err(ParseError::Todo("TypeAlias")),
+            Stmt::Delete(_) => Err(not_implemented("the 'del' statement")),
+            Stmt::TypeAlias(_) => Err(not_implemented("type aliases")),
             Stmt::Assign(ast::StmtAssign { targets, value, .. }) => self.parse_assignment(first(targets)?, *value),
             Stmt::AugAssign(ast::StmtAugAssign { target, op, value, .. }) => Ok(ParseNode::OpAssign {
                 target: self.parse_identifier(*target)?,
@@ -188,7 +207,7 @@ impl<'c> Parser<'c> {
                 ..
             }) => {
                 if is_async {
-                    return Err(ParseError::Todo("AsyncFor"));
+                    return Err(not_implemented("async for loops"));
                 }
                 Ok(ParseNode::For {
                     target: self.parse_identifier(*target)?,
@@ -197,7 +216,7 @@ impl<'c> Parser<'c> {
                     or_else: self.parse_statements(orelse)?,
                 })
             }
-            Stmt::While(_) => Err(ParseError::Todo("While")),
+            Stmt::While(_) => Err(not_implemented("while loops")),
             Stmt::If(ast::StmtIf {
                 test,
                 body,
@@ -211,12 +230,12 @@ impl<'c> Parser<'c> {
             }
             Stmt::With(ast::StmtWith { is_async, .. }) => {
                 if is_async {
-                    Err(ParseError::Todo("AsyncWith"))
+                    Err(not_implemented("async context managers (async with)"))
                 } else {
-                    Err(ParseError::Todo("With"))
+                    Err(not_implemented("context managers (with statements)"))
                 }
             }
-            Stmt::Match(_) => Err(ParseError::Todo("Match")),
+            Stmt::Match(_) => Err(not_implemented("pattern matching (match statements)")),
             Stmt::Raise(ast::StmtRaise { exc, .. }) => {
                 // TODO add cause to ParseNode::Raise
                 let expr = match exc {
@@ -227,9 +246,9 @@ impl<'c> Parser<'c> {
             }
             Stmt::Try(ast::StmtTry { is_star, .. }) => {
                 if is_star {
-                    Err(ParseError::Todo("TryStar"))
+                    Err(not_implemented("exception groups (try*/except*)"))
                 } else {
-                    Err(ParseError::Todo("Try"))
+                    Err(not_implemented("try/except blocks"))
                 }
             }
             Stmt::Assert(ast::StmtAssert { test, msg, .. }) => {
@@ -240,8 +259,8 @@ impl<'c> Parser<'c> {
                 };
                 Ok(ParseNode::Assert { test, msg })
             }
-            Stmt::Import(_) => Err(ParseError::Todo("Import")),
-            Stmt::ImportFrom(_) => Err(ParseError::Todo("ImportFrom")),
+            Stmt::Import(_) => Err(not_implemented("import statements")),
+            Stmt::ImportFrom(_) => Err(not_implemented("from...import statements")),
             Stmt::Global(ast::StmtGlobal { names, .. }) => {
                 let names = names.iter().map(|id| &self.code[id.range]).collect();
                 Ok(ParseNode::Global(names))
@@ -252,9 +271,9 @@ impl<'c> Parser<'c> {
             }
             Stmt::Expr(ast::StmtExpr { value, .. }) => Ok(ParseNode::Expr(self.parse_expression(*value)?)),
             Stmt::Pass(_) => Ok(ParseNode::Pass),
-            Stmt::Break(_) => Err(ParseError::Todo("Break")),
-            Stmt::Continue(_) => Err(ParseError::Todo("Continue")),
-            Stmt::IpyEscapeCommand(_) => Err(ParseError::Todo("IpyEscapeCommand")),
+            Stmt::Break(_) => Err(not_implemented("break statements")),
+            Stmt::Continue(_) => Err(not_implemented("continue statements")),
+            Stmt::IpyEscapeCommand(_) => Err(not_implemented("IPython escape commands")),
         }
     }
 
@@ -304,7 +323,7 @@ impl<'c> Parser<'c> {
                 }
                 Ok(result)
             }
-            AstExpr::Named(_) => Err(ParseError::Todo("NamedExpr")),
+            AstExpr::Named(_) => Err(not_implemented("named expressions (walrus operator :=)")),
             AstExpr::BinOp(ast::ExprBinOp {
                 left, op, right, range, ..
             }) => {
@@ -328,9 +347,9 @@ impl<'c> Parser<'c> {
                     let operand = Box::new(self.parse_expression(*operand)?);
                     Ok(ExprLoc::new(self.convert_range(range), Expr::UnaryMinus(operand)))
                 }
-                _ => Err(ParseError::Todo("UnaryOp other than Not/USub")),
+                _ => Err(not_implemented("unary operators other than 'not' and '-'")),
             },
-            AstExpr::Lambda(_) => Err(ParseError::Todo("Lambda")),
+            AstExpr::Lambda(_) => Err(not_implemented("lambda expressions")),
             AstExpr::If(ast::ExprIf {
                 test,
                 body,
@@ -354,19 +373,19 @@ impl<'c> Parser<'c> {
                         let value_expr = self.parse_expression(value)?;
                         pairs.push((key_expr, value_expr));
                     } else {
-                        return Err(ParseError::Todo("Dict unpacking (**kwargs)"));
+                        return Err(not_implemented("dictionary unpacking in literals"));
                     }
                 }
                 Ok(ExprLoc::new(self.convert_range(range), Expr::Dict(pairs)))
             }
-            AstExpr::Set(_) => Err(ParseError::Todo("Set")),
-            AstExpr::ListComp(_) => Err(ParseError::Todo("ListComp")),
-            AstExpr::SetComp(_) => Err(ParseError::Todo("SetComp")),
-            AstExpr::DictComp(_) => Err(ParseError::Todo("DictComp")),
-            AstExpr::Generator(_) => Err(ParseError::Todo("GeneratorExp")),
-            AstExpr::Await(_) => Err(ParseError::Todo("Await")),
-            AstExpr::Yield(_) => Err(ParseError::Todo("Yield")),
-            AstExpr::YieldFrom(_) => Err(ParseError::Todo("YieldFrom")),
+            AstExpr::Set(_) => Err(not_implemented("set literals")),
+            AstExpr::ListComp(_) => Err(not_implemented("list comprehensions")),
+            AstExpr::SetComp(_) => Err(not_implemented("set comprehensions")),
+            AstExpr::DictComp(_) => Err(not_implemented("dictionary comprehensions")),
+            AstExpr::Generator(_) => Err(not_implemented("generator expressions")),
+            AstExpr::Await(_) => Err(not_implemented("await expressions")),
+            AstExpr::Yield(_) => Err(not_implemented("yield expressions")),
+            AstExpr::YieldFrom(_) => Err(not_implemented("yield from expressions")),
             AstExpr::Compare(ast::ExprCompare {
                 left,
                 ops,
@@ -430,7 +449,7 @@ impl<'c> Parser<'c> {
                 }
             }
             AstExpr::FString(ast::ExprFString { value, range, .. }) => self.parse_fstring(value, range),
-            AstExpr::TString(_) => Err(ParseError::Todo("TString (template strings)")),
+            AstExpr::TString(_) => Err(not_implemented("template strings (t-strings)")),
             AstExpr::StringLiteral(ast::ExprStringLiteral { value, range, .. }) => Ok(ExprLoc::new(
                 self.convert_range(range),
                 Expr::Literal(Literal::Str(value.to_string())),
@@ -446,10 +465,10 @@ impl<'c> Parser<'c> {
                 let const_value = match value {
                     Number::Int(i) => match i.as_i64() {
                         Some(i) => Literal::Int(i),
-                        None => return Err(ParseError::Todo("BigInt Support")),
+                        None => return Err(not_implemented("integers larger than 64 bits")),
                     },
                     Number::Float(f) => Literal::Float(f),
-                    Number::Complex { .. } => return Err(ParseError::Todo("complex constants")),
+                    Number::Complex { .. } => return Err(not_implemented("complex constants")),
                 };
                 Ok(ExprLoc::new(self.convert_range(range), Expr::Literal(const_value)))
             }
@@ -464,7 +483,7 @@ impl<'c> Parser<'c> {
                 self.convert_range(range),
                 Expr::Literal(Literal::Ellipsis),
             )),
-            AstExpr::Attribute(_) => Err(ParseError::Todo("Attribute")),
+            AstExpr::Attribute(_) => Err(not_implemented("attribute access")),
             AstExpr::Subscript(ast::ExprSubscript {
                 value, slice, range, ..
             }) => {
@@ -475,7 +494,7 @@ impl<'c> Parser<'c> {
                     Expr::Subscript { object, index },
                 ))
             }
-            AstExpr::Starred(_) => Err(ParseError::Todo("Starred")),
+            AstExpr::Starred(_) => Err(not_implemented("starred expressions (*expr)")),
             AstExpr::Name(ast::ExprName { id, range, .. }) => {
                 let name = id.to_string();
                 let position = self.convert_range(range);
@@ -505,15 +524,15 @@ impl<'c> Parser<'c> {
 
                 Ok(ExprLoc::new(self.convert_range(range), Expr::Tuple(items)))
             }
-            AstExpr::Slice(_) => Err(ParseError::Todo("Slice")),
-            AstExpr::IpyEscapeCommand(_) => Err(ParseError::Todo("IpyEscapeCommand")),
+            AstExpr::Slice(_) => Err(not_implemented("slice syntax")),
+            AstExpr::IpyEscapeCommand(_) => Err(not_implemented("IPython escape commands")),
         }
     }
 
     fn parse_kwargs(&self, kwarg: Keyword) -> Result<Kwarg<'c>, ParseError<'c>> {
         let key = match kwarg.arg {
             Some(key) => self.identifier_from_range(key.range),
-            None => return Err(ParseError::Todo("kwargs with no key")),
+            None => return Err(not_implemented("keyword argument unpacking (**expr)")),
         };
         let value = self.parse_expression(kwarg.value)?;
         Ok(Kwarg { key, value })
@@ -645,7 +664,7 @@ impl<'c> Parser<'c> {
                 .collect();
             let parsed = static_spec
                 .parse()
-                .map_err(|spec| ParseError::Parsing(format!("Invalid format specifier '{spec}'")))?;
+                .map_err(|spec| syntax_error(format!("Invalid format specifier '{spec}'")))?;
             Ok(FormatSpec::Static(parsed))
         }
     }

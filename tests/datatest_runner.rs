@@ -244,7 +244,13 @@ fn run_test(path: &Path, code: &str, expectation: Expectation) {
         }
         Err(parse_err) => {
             if let Expectation::ParseError(expected) = expectation {
-                let err_msg = parse_err.summary();
+                // Format the parse error for comparison with test expectations
+                let err_msg = match &parse_err {
+                    monty::ParseError::PreEvalExc(exc) => format!("Exc: {}", exc.summary()),
+                    monty::ParseError::Internal(s) => format!("Internal: {s}"),
+                    monty::ParseError::PreEvalInternal(s) => format!("Eval Internal: {s}"),
+                    monty::ParseError::PreEvalResource(s) => format!("Resource: {s}"),
+                };
                 assert_eq!(err_msg, expected, "[{test_name}] Parse error mismatch");
             } else {
                 panic!("[{test_name}] Unexpected parse error: {parse_err:?}");

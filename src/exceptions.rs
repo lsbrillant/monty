@@ -33,6 +33,7 @@ pub enum ExcType {
     KeyError,
     IndexError,
     SyntaxError,
+    NotImplementedError,
 }
 
 impl ExcType {
@@ -254,6 +255,15 @@ impl ExcType {
     pub fn name_error_free_variable<'c>(name: &str) -> SimpleException<'c> {
         exc_fmt!(Self::NameError; "cannot access free variable '{}' where it is not associated with a value in enclosing scope", name)
     }
+
+    /// Creates a NotImplementedError for an unimplemented Python feature.
+    ///
+    /// Used during parsing when encountering Python syntax that Monty doesn't yet support.
+    /// The message format is: "The monty syntax parser does not yet support {feature}"
+    #[must_use]
+    pub fn not_implemented<'c>(feature: &str) -> SimpleException<'c> {
+        exc_fmt!(Self::NotImplementedError; "The monty syntax parser does not yet support {}", feature)
+    }
 }
 
 /// Simple lightweight representation of an exception.
@@ -297,6 +307,19 @@ impl<'c> SimpleException<'c> {
 
     pub(crate) fn type_str(&self) -> &'static str {
         self.exc_type.into()
+    }
+
+    /// Returns the exception formatted as Python would display it to the user.
+    ///
+    /// Format: `ExceptionType: message` (e.g., `NotImplementedError: feature not supported`)
+    /// If there's no message, just returns the exception type name.
+    #[must_use]
+    pub fn py_str(&self) -> String {
+        let type_str: &'static str = self.exc_type.into();
+        match &self.arg {
+            Some(arg) => format!("{type_str}: {arg}"),
+            None => type_str.to_string(),
+        }
     }
 
     /// Computes a hash for this exception based on its type and argument.
@@ -439,12 +462,24 @@ impl<'c> From<SimpleException<'c>> for ExceptionRaise<'c> {
 }
 
 impl ExceptionRaise<'_> {
-    pub(crate) fn summary(&self) -> String {
+    /// Returns a compact summary of the exception for test output.
+    ///
+    /// Format: `(position) ExceptionType('message')` or `(<no-tb>) ExceptionType('message')` if no traceback.
+    #[must_use]
+    pub fn summary(&self) -> String {
         if let Some(ref frame) = self.frame {
             format!("({}) {}", frame.position, self.exc)
         } else {
             format!("(<no-tb>) {}", self.exc)
         }
+    }
+
+    /// Returns the exception formatted as Python would display it to the user.
+    ///
+    /// Format: `ExceptionType: message` (e.g., `NotImplementedError: feature not supported`)
+    #[must_use]
+    pub fn py_str(&self) -> String {
+        self.exc.py_str()
     }
 }
 

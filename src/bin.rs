@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     let ex = match Executor::new(&code, file_path, &input_names) {
         Ok(ex) => ex,
         Err(err) => {
-            eprintln!("Error parsing code: {err}");
+            eprintln!("{err}");
             return ExitCode::FAILURE;
         }
     };

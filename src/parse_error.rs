@@ -4,25 +4,29 @@ use std::fmt;
 use crate::exceptions::{ExceptionRaise, InternalRunError, RunError};
 use crate::resource::ResourceError;
 
+/// Errors that can occur during parsing or preparation of Python code.
+///
+/// Most errors are represented as `PreEvalExc` containing a Python exception,
+/// allowing them to be displayed in Python's familiar exception format.
 #[derive(Debug, Clone)]
 pub enum ParseError<'c> {
-    Todo(&'c str),
-    Parsing(String),
+    /// Internal parsing error (should not occur in normal usage).
     Internal(Cow<'static, str>),
+    /// A Python exception raised during parsing or preparation.
     PreEvalExc(ExceptionRaise<'c>),
+    /// Internal runtime error during preparation.
     PreEvalInternal(InternalRunError),
+    /// Resource limit exceeded during preparation.
     PreEvalResource(ResourceError),
 }
 
 impl fmt::Display for ParseError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Todo(s) => write!(f, "TODO: {s}"),
             Self::Internal(s) => write!(f, "Internal parsing error: {s}"),
-            Self::Parsing(s) => write!(f, "Error parsing AST: {s}"),
-            Self::PreEvalExc(s) => write!(f, "Pre eval exception: {s}"),
-            Self::PreEvalInternal(s) => write!(f, "Pre eval internal error: {s}"),
-            Self::PreEvalResource(s) => write!(f, "Pre eval resource error: {s}"),
+            Self::PreEvalExc(exc) => write!(f, "{}", exc.py_str()),
+            Self::PreEvalInternal(s) => write!(f, "Internal error: {s}"),
+            Self::PreEvalResource(s) => write!(f, "Resource error: {s}"),
         }
     }
 }
@@ -46,19 +50,5 @@ impl<'c> From<ExceptionRaise<'c>> for ParseError<'c> {
 impl From<InternalRunError> for ParseError<'_> {
     fn from(internal_run_error: InternalRunError) -> Self {
         Self::PreEvalInternal(internal_run_error)
-    }
-}
-
-impl ParseError<'_> {
-    #[must_use]
-    pub fn summary(&self) -> String {
-        match self {
-            Self::Todo(s) => format!("TODO: {s}"),
-            Self::Internal(s) => format!("Internal: {s}"),
-            Self::Parsing(s) => format!("AST: {s}"),
-            Self::PreEvalExc(s) => format!("Exc: {}", s.summary()),
-            Self::PreEvalInternal(s) => format!("Eval Internal: {s}"),
-            Self::PreEvalResource(s) => format!("Resource: {s}"),
-        }
     }
 }
