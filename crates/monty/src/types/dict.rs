@@ -270,6 +270,14 @@ impl Dict {
         self.len() == 0
     }
 
+    /// Returns an iterator over references to all (key, value) pairs in the dict.
+    ///
+    /// The iteration order follows insertion order (IndexMap semantics).
+    /// This does NOT increment reference counts - use `copy_for_extend` pattern if needed.
+    pub fn iter_pairs(&self) -> impl Iterator<Item = (&Value, &Value)> {
+        self.map.values().flatten().map(|(k, v)| (k, v))
+    }
+
     /// Creates a deep clone of this dict with proper reference counting.
     ///
     /// All heap-allocated keys and values have their reference counts
@@ -286,6 +294,22 @@ impl Dict {
             new_map.insert(*hash, new_bucket);
         }
         Self { map: new_map }
+    }
+
+    /// Consumes the dict and returns a vector of all (key, value) pairs.
+    ///
+    /// Since ownership is just transferred, there should be no need to increment reference counts etc.
+    ///
+    /// TODO we should replace this with `into_iter` method to avoid intermediate allocation.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<(Value, Value)> {
+        let mut result = Vec::new();
+        for (_, bucket) in self.map {
+            for (k, v) in bucket {
+                result.push((k, v));
+            }
+        }
+        result
     }
 }
 

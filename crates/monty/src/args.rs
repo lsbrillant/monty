@@ -1,9 +1,12 @@
+use std::vec::IntoIter;
+
 use crate::{
     exceptions::ExcType,
     expressions::{ExprLoc, Identifier},
     heap::Heap,
-    intern::Interns,
+    intern::{Interns, StringId},
     run_frame::RunResult,
+    types::Dict,
     value::Value,
     ParseError, PyObject, ResourceTracker,
 };
@@ -15,23 +18,23 @@ use crate::{
 /// eliminates the Vec heap allocation overhead for the vast majority of calls.
 #[derive(Debug)]
 pub enum ArgValues {
-    Zero,
+    Empty,
     One(Value),
     Two(Value, Value),
-    Many(Vec<Value>),
-    // TODO kwarg types
+    Kwargs(KwargsValues),
+    ArgsKargs { args: Vec<Value>, kwargs: KwargsValues },
 }
 
 impl ArgValues {
     /// Checks that zero arguments were passed.
     pub fn check_zero_args(&self, name: &str) -> RunResult<()> {
         match self {
-            Self::Zero => Ok(()),
+            Self::Empty => Ok(()),
             _ => Err(ExcType::type_error_no_args(name, self.count())),
         }
     }
 
-    /// Checks that exactly one argument was passed, returning it.
+    /// Checks that exactly one positional argument was passed, returning it.
     pub fn get_one_arg(self, name: &str) -> RunResult<Value> {
         match self {
             Self::One(a) => Ok(a),
@@ -39,7 +42,7 @@ impl ArgValues {
         }
     }
 
-    /// Checks that exactly two arguments were passed, returning them as a tuple.
+    /// Checks that exactly two positional arguments were passed, returning them as a tuple.
     pub fn get_two_args(self, name: &str) -> RunResult<(Value, Value)> {
         match self {
             Self::Two(a1, a2) => Ok((a1, a2)),
@@ -52,47 +55,58 @@ impl ArgValues {
         match self {
             Self::One(a) => Ok((a, None)),
             Self::Two(a1, a2) => Ok((a1, Some(a2))),
-            Self::Zero => Err(ExcType::type_error_at_least(name, 1, self.count())),
-            Self::Many(_) => Err(ExcType::type_error_at_most(name, 2, self.count())),
+            Self::Empty => Err(ExcType::type_error_at_least(name, 1, self.count())),
+            _ => Err(ExcType::type_error_at_most(name, 2, self.count())),
         }
     }
 
-    /// Create a new namespace for a function arguments
-    pub fn inject_into_namespace(self, namespace: &mut Vec<Value>) {
+    /// Splits arguments into positional and keyword components.
+    ///
+    /// Returns (positional_args, keyword_args) where keyword_args is a Vec
+    /// of (key, value) pairs with keys as Values (InternString).
+    pub fn split(self) -> (Vec<Value>, KwargsValues) {
         match self {
-            Self::Zero => (),
-            Self::One(a) => {
-                namespace.push(a);
-            }
-            Self::Two(a1, a2) => {
-                namespace.push(a1);
-                namespace.push(a2);
-            }
-            Self::Many(args) => {
-                namespace.extend(args);
-            }
+            Self::Empty => (vec![], KwargsValues::Empty),
+            Self::One(v) => (vec![v], KwargsValues::Empty),
+            Self::Two(v1, v2) => (vec![v1, v2], KwargsValues::Empty),
+            Self::Kwargs(kwargs) => (vec![], kwargs),
+            Self::ArgsKargs { args, kwargs } => (args, kwargs),
         }
     }
 
     /// Converts the arguments into a Vec of PyObjects.
     ///
     /// This is used when passing arguments to external functions.
-    pub fn into_py_objects(self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Vec<PyObject> {
+    pub fn into_py_objects(
+        self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> (Vec<PyObject>, Vec<(PyObject, PyObject)>) {
         match self {
-            Self::Zero => vec![],
-            Self::One(a) => vec![PyObject::new(a, heap, interns)],
-            Self::Two(a1, a2) => vec![PyObject::new(a1, heap, interns), PyObject::new(a2, heap, interns)],
-            Self::Many(args) => args.into_iter().map(|v| PyObject::new(v, heap, interns)).collect(),
+            Self::Empty => (vec![], vec![]),
+            Self::One(a) => (vec![PyObject::new(a, heap, interns)], vec![]),
+            Self::Two(a1, a2) => (
+                vec![PyObject::new(a1, heap, interns), PyObject::new(a2, heap, interns)],
+                vec![],
+            ),
+            Self::Kwargs(kwargs) => (vec![], kwargs.into_py_objects(heap, interns)),
+            Self::ArgsKargs { args, kwargs } => (
+                args.into_iter().map(|v| PyObject::new(v, heap, interns)).collect(),
+                kwargs.into_py_objects(heap, interns),
+            ),
         }
     }
 
-    /// Returns the number of arguments.
+    /// Returns the number of positional arguments.
+    ///
+    /// For `Kwargs` returns 0, for `ArgsKargs` returns only the positional args count.
     fn count(&self) -> usize {
         match self {
-            Self::Zero => 0,
+            Self::Empty => 0,
             Self::One(_) => 1,
             Self::Two(_, _) => 2,
-            Self::Many(args) => args.len(),
+            Self::Kwargs(_) => 0,
+            Self::ArgsKargs { args, .. } => args.len(),
         }
     }
 
@@ -102,20 +116,138 @@ impl ArgValues {
     /// variants to maintain correct reference counts on the heap.
     pub fn drop_with_heap(self, heap: &mut Heap<impl ResourceTracker>) {
         match self {
-            Self::Zero => {}
+            Self::Empty => {}
             Self::One(v) => v.drop_with_heap(heap),
             Self::Two(v1, v2) => {
                 v1.drop_with_heap(heap);
                 v2.drop_with_heap(heap);
             }
-            Self::Many(args) => {
+            Self::Kwargs(kwargs) => {
+                kwargs.drop_with_heap(heap);
+            }
+            Self::ArgsKargs { args, kwargs } => {
                 for v in args {
+                    v.drop_with_heap(heap);
+                }
+                kwargs.drop_with_heap(heap);
+            }
+        }
+    }
+}
+
+/// Type for keyword arguments.
+///
+/// Used to capture both the case of inline keyword arguments `foo(foo=1, bar=2)`
+/// and the case of a dictionary passed as a single argument `foo(**kwargs)`.
+#[derive(Debug)]
+pub enum KwargsValues {
+    Empty,
+    Inline(Vec<(StringId, Value)>),
+    Dict(Dict),
+}
+
+impl KwargsValues {
+    /// Returns the number of keyword arguments.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Inline(kvs) => kvs.len(),
+            Self::Dict(dict) => dict.len(),
+        }
+    }
+
+    /// Returns true if there are no keyword arguments.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Converts the arguments into a Vec of PyObjects.
+    ///
+    /// This is used when passing arguments to external functions.
+    fn into_py_objects(self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Vec<(PyObject, PyObject)> {
+        match self {
+            KwargsValues::Empty => vec![],
+            KwargsValues::Inline(kvs) => kvs
+                .into_iter()
+                .map(|(k, v)| {
+                    let key = PyObject::String(interns.get_str(k).to_owned());
+                    let value = PyObject::new(v, heap, interns);
+                    (key, value)
+                })
+                .collect(),
+            KwargsValues::Dict(dict) => dict
+                // TODO we should use an into_iter type on dict to avoid intermediate allocation
+                .into_vec()
+                .into_iter()
+                .map(|(k, v)| (PyObject::new(k, heap, interns), PyObject::new(v, heap, interns)))
+                .collect(),
+        }
+    }
+
+    /// Properly drops all values in the arguments, decrementing reference counts.
+    pub fn drop_with_heap(self, heap: &mut Heap<impl ResourceTracker>) {
+        match self {
+            Self::Empty => {}
+            Self::Inline(kvs) => {
+                for (_, v) in kvs {
+                    v.drop_with_heap(heap);
+                }
+            }
+            Self::Dict(dict) => {
+                for (k, v) in dict.into_vec() {
+                    k.drop_with_heap(heap);
                     v.drop_with_heap(heap);
                 }
             }
         }
     }
 }
+
+impl IntoIterator for KwargsValues {
+    type Item = (Value, Value);
+    type IntoIter = KwargsValuesIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Empty => KwargsValuesIter::Empty,
+            Self::Inline(kvs) => KwargsValuesIter::Inline(kvs.into_iter()),
+            Self::Dict(dict) => KwargsValuesIter::Dict(dict.into_vec().into_iter()),
+        }
+    }
+}
+
+/// Iterator over keyword argument (key, value) pairs.
+///
+/// For `Inline` kwargs, converts `StringId` keys to `Value::InternString`.
+pub enum KwargsValuesIter {
+    Empty,
+    Inline(IntoIter<(StringId, Value)>),
+    Dict(IntoIter<(Value, Value)>),
+}
+
+impl Iterator for KwargsValuesIter {
+    type Item = (Value, Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::Inline(iter) => iter.next().map(|(k, v)| (Value::InternString(k), v)),
+            Self::Dict(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Empty => (0, Some(0)),
+            Self::Inline(iter) => iter.size_hint(),
+            Self::Dict(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for KwargsValuesIter {}
 
 /// A keyword argument in a function call expression.
 #[derive(Debug, Clone)]
@@ -127,22 +259,44 @@ pub struct Kwarg {
 /// Expressions that make up a function call's arguments.
 #[derive(Debug, Clone)]
 pub enum ArgExprs {
-    Zero,
+    Empty,
     One(Box<ExprLoc>),
     Two(Box<ExprLoc>, Box<ExprLoc>),
     Args(Vec<ExprLoc>),
     Kwargs(Vec<Kwarg>),
-    ArgsKargs { args: Vec<ExprLoc>, kwargs: Vec<Kwarg> },
+    ArgsKargs {
+        args: Option<Vec<ExprLoc>>,
+        var_args: Option<Box<ExprLoc>>,
+        kwargs: Option<Vec<Kwarg>>,
+        var_kwargs: Option<Box<ExprLoc>>,
+    },
 }
 
 impl ArgExprs {
     pub fn new(args: Vec<ExprLoc>, kwargs: Vec<Kwarg>) -> Self {
-        if !kwargs.is_empty() {
-            if args.is_empty() {
-                Self::Kwargs(kwargs)
-            } else {
-                Self::ArgsKargs { args, kwargs }
+        Self::new_with_var_kwargs(args, None, kwargs, None)
+    }
+
+    /// Creates a new `ArgExprs` with optional `*args` and `**kwargs` unpacking expressions.
+    ///
+    /// This is used when parsing function calls that may include `*expr` / `**expr`
+    /// syntax for unpacking iterables or mappings into arguments.
+    pub fn new_with_var_kwargs(
+        args: Vec<ExprLoc>,
+        var_args: Option<ExprLoc>,
+        kwargs: Vec<Kwarg>,
+        var_kwargs: Option<ExprLoc>,
+    ) -> Self {
+        // Full generality requires ArgsKargs when we have unpacking or mixed arg/kwarg usage
+        if var_args.is_some() || var_kwargs.is_some() || (!kwargs.is_empty() && !args.is_empty()) {
+            Self::ArgsKargs {
+                args: if args.is_empty() { None } else { Some(args) },
+                var_args: var_args.map(Box::new),
+                kwargs: if kwargs.is_empty() { None } else { Some(kwargs) },
+                var_kwargs: var_kwargs.map(Box::new),
             }
+        } else if !kwargs.is_empty() {
+            Self::Kwargs(kwargs)
         } else if args.len() > 2 {
             Self::Args(args)
         } else {
@@ -154,7 +308,7 @@ impl ArgExprs {
                     Self::One(Box::new(first))
                 }
             } else {
-                Self::Zero
+                Self::Empty
             }
         }
     }
@@ -168,9 +322,9 @@ impl ArgExprs {
         mut f: impl FnMut(ExprLoc) -> Result<ExprLoc, ParseError>,
     ) -> Result<(), ParseError> {
         // Swap self with Empty to take ownership, then rebuild
-        let taken = std::mem::replace(self, Self::Zero);
+        let taken = std::mem::replace(self, Self::Empty);
         *self = match taken {
-            Self::Zero => Self::Zero,
+            Self::Empty => Self::Empty,
             Self::One(arg) => Self::One(Box::new(f(*arg)?)),
             Self::Two(arg1, arg2) => Self::Two(Box::new(f(*arg1)?), Box::new(f(*arg2)?)),
             Self::Args(args) => Self::Args(args.into_iter().map(&mut f).collect::<Result<Vec<_>, _>>()?),
@@ -185,18 +339,35 @@ impl ArgExprs {
                     })
                     .collect::<Result<Vec<_>, ParseError>>()?,
             ),
-            Self::ArgsKargs { args, kwargs } => {
-                let args = args.into_iter().map(&mut f).collect::<Result<Vec<_>, ParseError>>()?;
+            Self::ArgsKargs {
+                args,
+                var_args,
+                kwargs,
+                var_kwargs,
+            } => {
+                let args = args
+                    .map(|a| a.into_iter().map(&mut f).collect::<Result<Vec<_>, ParseError>>())
+                    .transpose()?;
+                let var_args = var_args.map(|e| f(*e).map(Box::new)).transpose()?;
                 let kwargs = kwargs
-                    .into_iter()
-                    .map(|kwarg| {
-                        Ok(Kwarg {
-                            key: kwarg.key,
-                            value: f(kwarg.value)?,
-                        })
+                    .map(|k| {
+                        k.into_iter()
+                            .map(|kwarg| {
+                                Ok(Kwarg {
+                                    key: kwarg.key,
+                                    value: f(kwarg.value)?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, ParseError>>()
                     })
-                    .collect::<Result<Vec<_>, ParseError>>()?;
-                Self::ArgsKargs { args, kwargs }
+                    .transpose()?;
+                let var_kwargs = var_kwargs.map(|e| f(*e).map(Box::new)).transpose()?;
+                Self::ArgsKargs {
+                    args,
+                    var_args,
+                    kwargs,
+                    var_kwargs,
+                }
             }
         };
         Ok(())

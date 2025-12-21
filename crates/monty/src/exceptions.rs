@@ -39,6 +39,25 @@ pub enum ExcType {
     OverflowError,
 }
 
+/// Formats a list of parameter names for error messages.
+///
+/// Examples:
+/// - `["a"]` -> `'a'`
+/// - `["a", "b"]` -> `'a' and 'b'`
+/// - `["a", "b", "c"]` -> `'a', 'b' and 'c'`
+fn format_param_names(names: &[&str]) -> String {
+    match names.len() {
+        0 => String::new(),
+        1 => format!("'{}'", names[0]),
+        2 => format!("'{}' and '{}'", names[0], names[1]),
+        _ => {
+            let last = names.last().unwrap();
+            let rest: Vec<_> = names[..names.len() - 1].iter().map(|n| format!("'{n}'")).collect();
+            format!("{} and '{last}'", rest.join(", "))
+        }
+    }
+}
+
 impl ExcType {
     /// Creates an exception instance from an exception type and arguments.
     ///
@@ -53,7 +72,7 @@ impl ExcType {
         interns: &Interns,
     ) -> RunResult<Value> {
         match args {
-            ArgValues::Zero => Ok(Value::Exc(SimpleException::new(self, None))),
+            ArgValues::Empty => Ok(Value::Exc(SimpleException::new(self, None))),
             ArgValues::One(value) => {
                 // Borrow the value to inspect its type, then clean up with drop_with_heap
                 let result = match &value {
@@ -192,6 +211,93 @@ impl ExcType {
         exc_fmt!(Self::TypeError; "{} expected at most {} arguments, got {}", name, max, actual).into()
     }
 
+    /// Creates a TypeError for missing positional arguments.
+    ///
+    /// Matches CPython's format: `{name}() missing {count} required positional argument(s): 'a' and 'b'`
+    #[must_use]
+    pub fn type_error_missing_positional_with_names(name: &str, missing_names: &[&str]) -> RunError {
+        let count = missing_names.len();
+        let names_str = format_param_names(missing_names);
+        if count == 1 {
+            exc_fmt!(Self::TypeError; "{}() missing 1 required positional argument: {}", name, names_str).into()
+        } else {
+            exc_fmt!(Self::TypeError; "{}() missing {} required positional arguments: {}", name, count, names_str)
+                .into()
+        }
+    }
+
+    /// Creates a TypeError for missing keyword-only arguments.
+    ///
+    /// Matches CPython's format: `{name}() missing {count} required keyword-only argument(s): 'a' and 'b'`
+    #[must_use]
+    pub fn type_error_missing_kwonly_with_names(name: &str, missing_names: &[&str]) -> RunError {
+        let count = missing_names.len();
+        let names_str = format_param_names(missing_names);
+        if count == 1 {
+            exc_fmt!(Self::TypeError; "{}() missing 1 required keyword-only argument: {}", name, names_str).into()
+        } else {
+            exc_fmt!(Self::TypeError; "{}() missing {} required keyword-only arguments: {}", name, count, names_str)
+                .into()
+        }
+    }
+
+    /// Creates a TypeError for too many positional arguments.
+    ///
+    /// Matches CPython's format:
+    /// - Simple: `{name}() takes {max} positional argument(s) but {actual} were given`
+    /// - With kwonly: `{name}() takes {max} positional argument(s) but {actual} positional argument(s) (and N keyword-only argument(s)) were given`
+    #[must_use]
+    pub fn type_error_too_many_positional(name: &str, max: usize, actual: usize, kwonly_given: usize) -> RunError {
+        let takes_word = if max == 1 { "argument" } else { "arguments" };
+
+        if kwonly_given > 0 {
+            // CPython includes keyword-only args in the "given" part when present
+            let given_word = if actual == 1 { "argument" } else { "arguments" };
+            let kwonly_word = if kwonly_given == 1 { "argument" } else { "arguments" };
+            exc_fmt!(
+                Self::TypeError;
+                "{}() takes {} positional {} but {} positional {} (and {} keyword-only {}) were given",
+                name, max, takes_word, actual, given_word, kwonly_given, kwonly_word
+            )
+            .into()
+        } else if max == 0 {
+            exc_fmt!(Self::TypeError; "{}() takes 0 positional arguments but {} were given", name, actual).into()
+        } else {
+            exc_fmt!(Self::TypeError; "{}() takes {} positional {} but {} were given", name, max, takes_word, actual)
+                .into()
+        }
+    }
+
+    /// Creates a TypeError for positional-only parameter passed as keyword.
+    ///
+    /// Matches CPython's format: `{name}() got some positional-only arguments passed as keyword arguments: '{param}'`
+    #[must_use]
+    pub fn type_error_positional_only(name: &str, param: &str) -> RunError {
+        exc_fmt!(Self::TypeError; "{}() got some positional-only arguments passed as keyword arguments: '{}'", name, param).into()
+    }
+
+    /// Creates a TypeError for duplicate argument.
+    ///
+    /// Matches CPython's format: `{name}() got multiple values for argument '{param}'`
+    #[must_use]
+    pub fn type_error_duplicate_arg(name: &str, param: &str) -> RunError {
+        exc_fmt!(Self::TypeError; "{}() got multiple values for argument '{}'", name, param).into()
+    }
+
+    /// Creates a TypeError for unexpected keyword argument.
+    ///
+    /// Matches CPython's format: `{name}() got an unexpected keyword argument '{key}'`
+    #[must_use]
+    pub fn type_error_unexpected_keyword(name: &str, key: &str) -> RunError {
+        exc_fmt!(Self::TypeError; "{}() got an unexpected keyword argument '{}'", name, key).into()
+    }
+
+    /// Creates a simple TypeError with a custom message.
+    #[must_use]
+    pub fn type_error(msg: &str) -> RunError {
+        exc_fmt!(Self::TypeError; "{}", msg).into()
+    }
+
     /// Creates an IndexError for list index out of range.
     ///
     /// Matches CPython's format: `IndexError('list index out of range')`
@@ -328,6 +434,26 @@ impl ExcType {
     #[must_use]
     pub fn overflow_repeat_count() -> SimpleException {
         exc_static!(Self::OverflowError; "cannot fit 'int' into an index-sized integer")
+    }
+
+    /// Generates a consistent error for invalid `**kwargs` types.
+    #[must_use]
+    pub fn kwargs_type_error(callable_name: Option<&str>, type_name: &str) -> SimpleException {
+        let message = match callable_name {
+            Some(name) => format!("{name}() argument after ** must be a mapping, not {type_name}"),
+            None => format!("argument after ** must be a mapping, not {type_name}"),
+        };
+        SimpleException::new(ExcType::TypeError, Some(message))
+    }
+
+    /// Generates the duplicate keyword argument error.
+    #[must_use]
+    pub fn duplicate_kwarg_error(callable_name: Option<&str>, key: &str) -> SimpleException {
+        let message = match callable_name {
+            Some(name) => format!("{name}() got multiple values for keyword argument '{key}'"),
+            None => format!("got multiple values for keyword argument '{key}'"),
+        };
+        SimpleException::new(ExcType::TypeError, Some(message))
     }
 }
 

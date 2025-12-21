@@ -404,6 +404,7 @@ fn run_iter_loop(exec: ExecutorIter) -> Result<PyObject, RunError> {
             ExecProgress::FunctionCall {
                 function_name,
                 args,
+                kwargs: _,
                 state,
             } => {
                 let return_value = dispatch_external_call(&function_name, args);

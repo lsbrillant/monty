@@ -303,7 +303,7 @@ impl<'i, P: AbstractPositionTracker, W: PrintWriter> RunFrame<'i, P, W> {
                 Value::Builtin(builtin) => {
                     // Callable is inline - call it to get the exception
                     let builtin = *builtin;
-                    let result = builtin.call(heap, ArgValues::Zero, self.interns, self.writer)?;
+                    let result = builtin.call(heap, ArgValues::Empty, self.interns, self.writer)?;
                     if matches!(&result, Value::Exc(_)) {
                         // No need to drop value - Callable is Copy and doesn't need cleanup
                         let exc = result.into_exc();
@@ -638,6 +638,7 @@ impl<'i, P: AbstractPositionTracker, W: PrintWriter> RunFrame<'i, P, W> {
     ///
     /// If the function has free_var_enclosing_slots (captures variables from enclosing scope),
     /// this captures the cells from the enclosing namespace and stores a Closure.
+    /// If the function has default values, they are evaluated at definition time and stored.
     /// Otherwise, it stores a simple Function reference.
     ///
     /// # Cell Sharing
@@ -646,12 +647,43 @@ impl<'i, P: AbstractPositionTracker, W: PrintWriter> RunFrame<'i, P, W> {
     /// looked up from the enclosing namespace slots specified in free_var_enclosing_slots.
     /// This ensures modifications through `nonlocal` are visible to both scopes.
     fn define_function(
-        &self,
+        &mut self,
         namespaces: &mut Namespaces,
         heap: &mut Heap<impl ResourceTracker>,
         function_id: FunctionId,
     ) -> RunResult<()> {
         let function = self.interns.get_function(function_id);
+
+        // Evaluate default expressions at definition time
+        // These are evaluated in the enclosing scope (not the function's own scope)
+        let defaults = if function.has_defaults() {
+            let mut defaults = Vec::with_capacity(function.default_exprs.len());
+            for expr in &function.default_exprs {
+                match self.execute_expr(namespaces, heap, expr) {
+                    Ok(EvalResult::Value(value)) => defaults.push(value),
+                    Ok(EvalResult::ExternalCall(_)) => {
+                        // External calls in default expressions are not supported
+                        for value in defaults.drain(..) {
+                            value.drop_with_heap(heap);
+                        }
+                        return Err(ExcType::not_implemented(
+                            "external function calls in default parameter expressions",
+                        )
+                        .into());
+                    }
+                    Err(err) => {
+                        for value in defaults.drain(..) {
+                            value.drop_with_heap(heap);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            defaults
+        } else {
+            Vec::new()
+        };
+
         let new_value = if function.is_closure() {
             // This function captures variables from enclosing scopes.
             // Look up the cell HeapIds from the enclosing namespace.
@@ -669,9 +701,12 @@ impl<'i, P: AbstractPositionTracker, W: PrintWriter> RunFrame<'i, P, W> {
                 captured_cells.push(*cell_id);
             }
 
-            Value::Ref(heap.allocate(HeapData::Closure(function_id, captured_cells))?)
+            Value::Ref(heap.allocate(HeapData::Closure(function_id, captured_cells, defaults))?)
+        } else if !defaults.is_empty() {
+            // Non-closure function with defaults needs heap allocation
+            Value::Ref(heap.allocate(HeapData::FunctionDefaults(function_id, defaults))?)
         } else {
-            // Simple function without captures
+            // Simple function without captures or defaults
             Value::Function(function_id)
         };
 

@@ -1,14 +1,11 @@
 use std::fmt::Write;
 use std::str::FromStr;
 
-/// Built-in functions for the Python interpreter.
-///
-/// This module contains the `Builtins` enum representing all supported built-in
-/// functions (print, len, str, etc.).
-use strum::{Display, EnumString};
+use strum::{Display, EnumString, IntoStaticStr};
 
-use crate::args::ArgValues;
-use crate::exceptions::{exc_err_fmt, ExcType};
+use crate::args::{ArgValues, KwargsValues};
+use crate::exceptions::{exc_err_fmt, exc_fmt, ExcType};
+use crate::RunError;
 
 use crate::heap::{Heap, HeapData};
 use crate::intern::Interns;
@@ -82,9 +79,9 @@ impl FromStr for Builtins {
 
 /// Enumerates every interpreter-native Python builtin functions like `print`, `len`, etc.
 ///
-/// Uses strum derives for automatic `Display` and `FromStr` implementations.
+/// Uses strum derives for automatic `Display`, `FromStr`, and `IntoStaticStr` implementations.
 /// All variants serialize to lowercase (e.g., `Print` -> "print").
-#[derive(Debug, Clone, Copy, Display, EnumString, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Display, EnumString, IntoStaticStr, PartialEq, Eq)]
 #[strum(serialize_all = "lowercase")]
 pub enum BuiltinsFunctions {
     Print,
@@ -109,30 +106,7 @@ impl BuiltinsFunctions {
         writer: &mut impl PrintWriter,
     ) -> RunResult<Value> {
         match self {
-            Self::Print => {
-                match &args {
-                    ArgValues::Zero => {}
-                    ArgValues::One(a) => {
-                        writer.stdout_write(a.py_str(heap, interns));
-                    }
-                    ArgValues::Two(a1, a2) => {
-                        writer.stdout_write(a1.py_str(heap, interns));
-                        writer.stdout_push(' ');
-                        writer.stdout_write(a2.py_str(heap, interns));
-                    }
-                    ArgValues::Many(many) => {
-                        let mut iter = many.iter();
-                        writer.stdout_write(iter.next().unwrap().py_str(heap, interns));
-                        for value in iter {
-                            writer.stdout_push(' ');
-                            writer.stdout_write(value.py_str(heap, interns));
-                        }
-                    }
-                }
-                writer.stdout_push('\n');
-                args.drop_with_heap(heap);
-                Ok(Value::None)
-            }
+            Self::Print => builtin_print(heap, args, interns, writer),
             Self::Len => {
                 let value = args.get_one_arg("len")?;
                 let result = match value.py_len(heap, interns) {
@@ -189,4 +163,143 @@ impl BuiltinsFunctions {
             }
         }
     }
+}
+
+/// Implementation of the print() builtin function.
+///
+/// Supports the following keyword arguments:
+/// - `sep`: separator between values (default: " ")
+/// - `end`: string appended after the last value (default: "\n")
+/// - `flush`: whether to flush the stream (accepted but ignored)
+///
+/// The `file` kwarg is not supported.
+fn builtin_print(
+    heap: &mut Heap<impl ResourceTracker>,
+    args: ArgValues,
+    interns: &Interns,
+    writer: &mut impl PrintWriter,
+) -> RunResult<Value> {
+    // Split into positional args and kwargs
+    let (positional, kwargs) = args.split();
+
+    // Extract kwargs first, consuming them - this handles cleanup on error
+    let (sep, end) = match extract_print_kwargs(kwargs, heap, interns) {
+        Ok(se) => se,
+        Err(err) => {
+            for value in positional {
+                value.drop_with_heap(heap);
+            }
+            return Err(err);
+        }
+    };
+
+    // Print positional args with separator
+    let mut iter = positional.iter();
+    if let Some(value) = iter.next() {
+        writer.stdout_write(value.py_str(heap, interns));
+        for value in iter {
+            if let Some(sep) = &sep {
+                writer.stdout_write(sep.as_str().into());
+            } else {
+                writer.stdout_push(' ');
+            }
+            writer.stdout_write(value.py_str(heap, interns));
+        }
+    }
+
+    // Append end string
+    if let Some(end) = end {
+        writer.stdout_write(end.into());
+    } else {
+        writer.stdout_push('\n');
+    }
+
+    // Drop positional args
+    for value in positional {
+        value.drop_with_heap(heap);
+    }
+
+    Ok(Value::None)
+}
+
+/// Extracts sep and end kwargs from print() arguments.
+///
+/// Consumes the kwargs, dropping all values after extraction.
+/// Returns (sep, end, error) where error is Some if a kwarg error occurred.
+fn extract_print_kwargs(
+    kwargs: KwargsValues,
+    heap: &mut Heap<impl ResourceTracker>,
+    interns: &Interns,
+) -> RunResult<(Option<String>, Option<String>)> {
+    let mut sep: Option<String> = None;
+    let mut end: Option<String> = None;
+    let mut error: Option<RunError> = None;
+
+    for (key, value) in kwargs {
+        // If we already hit an error, just drop remaining values
+        if error.is_some() {
+            key.drop_with_heap(heap);
+            value.drop_with_heap(heap);
+            continue;
+        }
+
+        let Some(keyword_name) = key.as_either_str(heap) else {
+            key.drop_with_heap(heap);
+            value.drop_with_heap(heap);
+            error = Some(exc_fmt!(ExcType::TypeError; "keywords must be strings").into());
+            continue;
+        };
+
+        let key_str = keyword_name.as_str(interns);
+        match key_str {
+            "sep" => match extract_string_kwarg(&value, "sep", heap, interns) {
+                Ok(custom_sep) => sep = custom_sep,
+                Err(e) => error = Some(e),
+            },
+            "end" => match extract_string_kwarg(&value, "end", heap, interns) {
+                Ok(custom_end) => end = custom_end,
+                Err(e) => error = Some(e),
+            },
+            "flush" => {} // Accepted but ignored (we don't buffer output)
+            "file" => {
+                error = Some(exc_fmt!(ExcType::TypeError; "print() 'file' argument is not supported").into());
+            }
+            _ => {
+                error = Some(
+                    exc_fmt!(ExcType::TypeError; "'{}' is an invalid keyword argument for print()", key_str).into(),
+                );
+            }
+        }
+        key.drop_with_heap(heap);
+        value.drop_with_heap(heap);
+    }
+
+    if let Some(error) = error {
+        Err(error)
+    } else {
+        Ok((sep, end))
+    }
+}
+
+/// Extracts a string value from a print() kwarg.
+///
+/// The kwarg can be None (returns empty string) or a string.
+/// Raises TypeError for other types.
+fn extract_string_kwarg(
+    value: &Value,
+    name: &str,
+    heap: &Heap<impl ResourceTracker>,
+    interns: &Interns,
+) -> RunResult<Option<String>> {
+    match value {
+        Value::None => return Ok(None),
+        Value::InternString(string_id) => return Ok(Some(interns.get_str(*string_id).to_owned())),
+        Value::Ref(id) => {
+            if let HeapData::Str(s) = heap.get(*id) {
+                return Ok(Some(s.as_str().to_owned()));
+            }
+        }
+        _ => {}
+    }
+    exc_err_fmt!(ExcType::TypeError; "{} must be None or a string, not {}", name, value.py_type(Some(heap)))
 }

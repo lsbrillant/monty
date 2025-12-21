@@ -19,6 +19,7 @@ mod position;
 mod prepare;
 mod resource;
 mod run_frame;
+mod signature;
 mod types;
 mod value;
 

@@ -13,7 +13,7 @@ fn external_function_call_expression_statement() {
     let exec = ExecutorIter::new("foo(1, 2)", "test.py", &[], vec!["foo".to_string()]).unwrap();
     let progress = exec.run_no_limits(vec![], &mut StdPrint).unwrap();
 
-    let (name, args, state) = progress.into_function_call().expect("function call");
+    let (name, args, _kwargs, state) = progress.into_function_call().expect("function call");
     assert_eq!(name, "foo");
     assert_eq!(args, vec![PyObject::Int(1), PyObject::Int(2)]);
 
@@ -36,7 +36,7 @@ result + 10",
     .unwrap();
     let progress = exec.run_no_limits(vec![], &mut StdPrint).unwrap();
 
-    let (name, args, state) = progress.into_function_call().expect("function call");
+    let (name, args, _kwargs, state) = progress.into_function_call().expect("function call");
     assert_eq!(name, "foo");
     assert_eq!(args, vec![PyObject::Int(1), PyObject::Int(2)]);
 
@@ -60,7 +60,7 @@ x",
     .unwrap();
     let progress = exec.run_no_limits(vec![], &mut StdPrint).unwrap();
 
-    let (name, args, state) = progress.into_function_call().expect("function call");
+    let (name, args, _kwargs, state) = progress.into_function_call().expect("function call");
     assert_eq!(name, "get_value");
     assert!(args.is_empty());
 
@@ -81,7 +81,7 @@ a + b";
     let exec = ExecutorIter::new(code, "test.py", &[], vec!["foo".to_owned(), "bar".to_owned()]).unwrap();
 
     // First external call: foo(1)
-    let (name, args, state) = exec
+    let (name, args, _kwargs, state) = exec
         .run_no_limits(vec![], &mut StdPrint)
         .unwrap()
         .into_function_call()
@@ -93,7 +93,7 @@ a + b";
     let progress = state.run(PyObject::Int(10), &mut StdPrint).unwrap();
 
     // Second external call: bar(2)
-    let (name, args, state) = progress.into_function_call().expect("second call");
+    let (name, args, _kwargs, state) = progress.into_function_call().expect("second call");
     assert_eq!(name, "bar");
     assert_eq!(args, vec![PyObject::Int(2)]);
 
@@ -109,7 +109,7 @@ fn external_function_call_with_builtin_args() {
     let exec = ExecutorIter::new("foo(len([1, 2, 3]))", "test.py", &[], vec!["foo".to_owned()]).unwrap();
     let progress = exec.run_no_limits(vec![], &mut StdPrint).unwrap();
 
-    let (name, args, _) = progress.into_function_call().expect("function call");
+    let (name, args, _kwargs, _) = progress.into_function_call().expect("function call");
     assert_eq!(name, "foo");
     // len([1, 2, 3]) = 3, so args should be [3]
     assert_eq!(args, vec![PyObject::Int(3)]);
@@ -124,7 +124,7 @@ y = foo(x)
 x + y";
     let exec = ExecutorIter::new(code, "test.py", &[], vec!["foo".to_owned()]).unwrap();
 
-    let (_, args, state) = exec
+    let (_, args, _kwargs, state) = exec
         .run_no_limits(vec![], &mut StdPrint)
         .unwrap()
         .into_function_call()
@@ -145,7 +145,7 @@ fn external_function_nested_calls() {
     let exec = ExecutorIter::new(code, "test.py", &[], vec!["foo".to_owned(), "bar".to_owned()]).unwrap();
 
     // First: inner call bar(42)
-    let (name, args, state) = exec
+    let (name, args, _kwargs, state) = exec
         .run_no_limits(vec![], &mut StdPrint)
         .unwrap()
         .into_function_call()
@@ -157,7 +157,7 @@ fn external_function_nested_calls() {
     let progress = state.run(PyObject::Int(43), &mut StdPrint).unwrap();
 
     // Second: outer call foo(43)
-    let (name, args, state) = progress.into_function_call().expect("function call");
+    let (name, args, _kwargs, state) = progress.into_function_call().expect("function call");
 
     assert_eq!(name, "foo");
     assert_eq!(args, vec![PyObject::Int(43)]);
@@ -173,7 +173,7 @@ fn clone_executor_iter() {
     let exec2 = exec1.clone();
 
     // Run first executor
-    let (name, args, state) = exec1
+    let (name, args, _kwargs, state) = exec1
         .run_no_limits(vec![], &mut StdPrint)
         .unwrap()
         .into_function_call()
@@ -184,7 +184,7 @@ fn clone_executor_iter() {
     assert_eq!(result.into_complete().expect("complete"), PyObject::Int(100));
 
     // Run second executor (clone) - should work independently
-    let (name, args, state) = exec2
+    let (name, args, _kwargs, state) = exec2
         .run_no_limits(vec![], &mut StdPrint)
         .unwrap()
         .into_function_call()
@@ -208,7 +208,7 @@ result";
     let exec = ExecutorIter::new(code, "test.py", &[], vec!["foo".to_owned(), "bar".to_owned()]).unwrap();
 
     // Should call foo(10), not bar
-    let (name, args, state) = exec
+    let (name, args, _kwargs, state) = exec
         .run_no_limits(vec![], &mut StdPrint)
         .unwrap()
         .into_function_call()
@@ -233,7 +233,7 @@ result";
     let exec = ExecutorIter::new(code, "test.py", &[], vec!["foo".to_owned(), "bar".to_owned()]).unwrap();
 
     // Should call bar(20), not foo
-    let (name, args, state) = exec
+    let (name, args, _kwargs, state) = exec
         .run_no_limits(vec![], &mut StdPrint)
         .unwrap()
         .into_function_call()
@@ -256,7 +256,7 @@ total";
     let exec = ExecutorIter::new(code, "test.py", &[], vec!["get_value".to_owned()]).unwrap();
 
     // First iteration: get_value(0)
-    let (name, args, state) = exec
+    let (name, args, _kwargs, state) = exec
         .run_no_limits(vec![], &mut StdPrint)
         .unwrap()
         .into_function_call()
@@ -266,13 +266,13 @@ total";
     let progress = state.run(PyObject::Int(10), &mut StdPrint).unwrap();
 
     // Second iteration: get_value(1)
-    let (name, args, state) = progress.into_function_call().expect("second call");
+    let (name, args, _kwargs, state) = progress.into_function_call().expect("second call");
     assert_eq!(name, "get_value");
     assert_eq!(args, vec![PyObject::Int(1)]);
     let progress = state.run(PyObject::Int(20), &mut StdPrint).unwrap();
 
     // Third iteration: get_value(2)
-    let (name, args, state) = progress.into_function_call().expect("third call");
+    let (name, args, _kwargs, state) = progress.into_function_call().expect("third call");
     assert_eq!(name, "get_value");
     assert_eq!(args, vec![PyObject::Int(2)]);
     let result = state.run(PyObject::Int(30), &mut StdPrint).unwrap();
@@ -293,7 +293,7 @@ results";
     let exec = ExecutorIter::new(code, "test.py", &[], vec!["compute".to_owned()]).unwrap();
 
     // First iteration: compute(0)
-    let (name, args, state) = exec
+    let (name, args, _kwargs, state) = exec
         .run_no_limits(vec![], &mut StdPrint)
         .unwrap()
         .into_function_call()
@@ -303,7 +303,7 @@ results";
     let progress = state.run(PyObject::String("a".to_string()), &mut StdPrint).unwrap();
 
     // Second iteration: compute(1)
-    let (name, args, state) = progress.into_function_call().expect("second call");
+    let (name, args, _kwargs, state) = progress.into_function_call().expect("second call");
     assert_eq!(name, "compute");
     assert_eq!(args, vec![PyObject::Int(1)]);
     let result = state.run(PyObject::String("b".to_string()), &mut StdPrint).unwrap();
@@ -315,5 +315,88 @@ results";
             PyObject::String("a".to_string()),
             PyObject::String("b".to_string())
         ])
+    );
+}
+
+#[test]
+fn external_function_call_with_kwargs() {
+    // Test external function call with keyword arguments
+    let exec = ExecutorIter::new("foo(a=1, b=2)", "test.py", &[], vec!["foo".to_string()]).unwrap();
+    let progress = exec.run_no_limits(vec![], &mut StdPrint).unwrap();
+
+    let (name, args, kwargs, state) = progress.into_function_call().expect("function call");
+    assert_eq!(name, "foo");
+    assert!(args.is_empty());
+    assert_eq!(kwargs.len(), 2);
+    // Check kwargs contain the right key-value pairs
+    let kwargs_map: std::collections::HashMap<_, _> = kwargs.into_iter().collect();
+    assert_eq!(
+        kwargs_map.get(&PyObject::String("a".to_string())),
+        Some(&PyObject::Int(1))
+    );
+    assert_eq!(
+        kwargs_map.get(&PyObject::String("b".to_string())),
+        Some(&PyObject::Int(2))
+    );
+
+    let result = state.run(PyObject::Int(100), &mut StdPrint).unwrap();
+    assert_eq!(result.into_complete().expect("complete"), PyObject::Int(100));
+}
+
+#[test]
+fn external_function_call_with_mixed_args_and_kwargs() {
+    // Test external function call with both positional and keyword arguments
+    let exec = ExecutorIter::new("foo(1, 2, x=3, y=4)", "test.py", &[], vec!["foo".to_string()]).unwrap();
+    let progress = exec.run_no_limits(vec![], &mut StdPrint).unwrap();
+
+    let (name, args, kwargs, state) = progress.into_function_call().expect("function call");
+    assert_eq!(name, "foo");
+    assert_eq!(args, vec![PyObject::Int(1), PyObject::Int(2)]);
+    assert_eq!(kwargs.len(), 2);
+    let kwargs_map: std::collections::HashMap<_, _> = kwargs.into_iter().collect();
+    assert_eq!(
+        kwargs_map.get(&PyObject::String("x".to_string())),
+        Some(&PyObject::Int(3))
+    );
+    assert_eq!(
+        kwargs_map.get(&PyObject::String("y".to_string())),
+        Some(&PyObject::Int(4))
+    );
+
+    let result = state.run(PyObject::Int(10), &mut StdPrint).unwrap();
+    assert_eq!(result.into_complete().expect("complete"), PyObject::Int(10));
+}
+
+#[test]
+fn external_function_call_kwargs_in_assignment() {
+    // Test external function call with kwargs in assignment context
+    let code = "
+result = fetch(url='http://example.com', timeout=30)
+result";
+    let exec = ExecutorIter::new(code, "test.py", &[], vec!["fetch".to_owned()]).unwrap();
+
+    let (name, args, kwargs, state) = exec
+        .run_no_limits(vec![], &mut StdPrint)
+        .unwrap()
+        .into_function_call()
+        .expect("function call");
+    assert_eq!(name, "fetch");
+    assert!(args.is_empty());
+    let kwargs_map: std::collections::HashMap<_, _> = kwargs.into_iter().collect();
+    assert_eq!(
+        kwargs_map.get(&PyObject::String("url".to_string())),
+        Some(&PyObject::String("http://example.com".to_string()))
+    );
+    assert_eq!(
+        kwargs_map.get(&PyObject::String("timeout".to_string())),
+        Some(&PyObject::Int(30))
+    );
+
+    let result = state
+        .run(PyObject::String("response".to_string()), &mut StdPrint)
+        .unwrap();
+    assert_eq!(
+        result.into_complete().expect("complete"),
+        PyObject::String("response".to_string())
     );
 }

@@ -262,7 +262,9 @@ impl PyObject {
                         // Show the cell's contents
                         PyObject::from_value_inner(inner, heap, visited, interns)
                     }
-                    HeapData::Closure(..) => Self::Repr(object.py_repr(heap, interns).into_owned()),
+                    HeapData::Closure(..) | HeapData::FunctionDefaults(..) => {
+                        Self::Repr(object.py_repr(heap, interns).into_owned())
+                    }
                 };
 
                 // Remove from visited set after processing

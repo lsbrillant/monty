@@ -42,10 +42,17 @@ pub enum HeapData {
     Dict(Dict),
     /// A closure: a function that captures variables from enclosing scopes.
     ///
-    /// Contains a reference to the function definition and a vector of captured cell HeapIds.
-    /// When the closure is called, these cells are passed to the RunFrame for variable access.
-    /// When the closure is dropped, we must decrement the ref count on each captured cell.
-    Closure(FunctionId, Vec<HeapId>),
+    /// Contains a reference to the function definition, a vector of captured cell HeapIds,
+    /// and evaluated default values (if any). When the closure is called, these cells are
+    /// passed to the RunFrame for variable access. When the closure is dropped, we must
+    /// decrement the ref count on each captured cell and each default value.
+    Closure(FunctionId, Vec<HeapId>, Vec<Value>),
+    /// A function with evaluated default parameter values (non-closure).
+    ///
+    /// Contains a reference to the function definition and the evaluated default values.
+    /// When the function is called, defaults are cloned for missing optional parameters.
+    /// When dropped, we must decrement the ref count on each default value.
+    FunctionDefaults(FunctionId, Vec<Value>),
     /// A cell wrapping a single mutable value for closure support.
     ///
     /// Cells enable nonlocal variable access by providing a heap-allocated
@@ -86,7 +93,7 @@ impl HeapData {
                 }
                 Some(hasher.finish())
             }
-            Self::Closure(f, _) => {
+            Self::Closure(f, _, _) | Self::FunctionDefaults(f, _) => {
                 let mut hasher = DefaultHasher::new();
                 // TODO, this is NOT proper hashing, we should somehow hash the function properly
                 f.hash(&mut hasher);
@@ -110,7 +117,7 @@ impl PyTrait for HeapData {
             Self::List(l) => l.py_type(heap),
             Self::Tuple(t) => t.py_type(heap),
             Self::Dict(d) => d.py_type(heap),
-            Self::Closure(_, _) => "function",
+            Self::Closure(_, _, _) | Self::FunctionDefaults(_, _) => "function",
             Self::Cell(_) => "cell",
         }
     }
@@ -122,8 +129,8 @@ impl PyTrait for HeapData {
             Self::List(l) => l.py_estimate_size(),
             Self::Tuple(t) => t.py_estimate_size(),
             Self::Dict(d) => d.py_estimate_size(),
-            // TODO is this right?
-            Self::Closure(_, _) => 0,
+            // TODO: should include size of captured cells and defaults
+            Self::Closure(_, _, _) | Self::FunctionDefaults(_, _) => 0,
             Self::Cell(v) => std::mem::size_of::<Value>() + v.py_estimate_size(),
         }
     }
@@ -146,7 +153,8 @@ impl PyTrait for HeapData {
             (Self::List(a), Self::List(b)) => a.py_eq(b, heap, interns),
             (Self::Tuple(a), Self::Tuple(b)) => a.py_eq(b, heap, interns),
             (Self::Dict(a), Self::Dict(b)) => a.py_eq(b, heap, interns),
-            (Self::Closure(a_id, a_cells), Self::Closure(b_id, b_cells)) => *a_id == *b_id && a_cells == b_cells,
+            (Self::Closure(a_id, a_cells, _), Self::Closure(b_id, b_cells, _)) => *a_id == *b_id && a_cells == b_cells,
+            (Self::FunctionDefaults(a_id, _), Self::FunctionDefaults(b_id, _)) => *a_id == *b_id,
             // Cells compare by identity only (handled at Value level via HeapId comparison)
             (Self::Cell(_), Self::Cell(_)) => false,
             _ => false, // Different types are never equal
@@ -160,7 +168,20 @@ impl PyTrait for HeapData {
             Self::List(l) => l.py_dec_ref_ids(stack),
             Self::Tuple(t) => t.py_dec_ref_ids(stack),
             Self::Dict(d) => d.py_dec_ref_ids(stack),
-            Self::Closure(_, _) => {}
+            Self::Closure(_, cells, defaults) => {
+                // Decrement ref count for captured cells
+                stack.extend(cells.iter().copied());
+                // Decrement ref count for default values that are heap references
+                for default in defaults.iter_mut() {
+                    default.py_dec_ref_ids(stack);
+                }
+            }
+            Self::FunctionDefaults(_, defaults) => {
+                // Decrement ref count for default values that are heap references
+                for default in defaults.iter_mut() {
+                    default.py_dec_ref_ids(stack);
+                }
+            }
             Self::Cell(v) => v.py_dec_ref_ids(stack),
         }
     }
@@ -172,7 +193,7 @@ impl PyTrait for HeapData {
             Self::List(l) => l.py_bool(heap, interns),
             Self::Tuple(t) => t.py_bool(heap, interns),
             Self::Dict(d) => d.py_bool(heap, interns),
-            Self::Closure(_, _) => true,
+            Self::Closure(_, _, _) | Self::FunctionDefaults(_, _) => true,
             Self::Cell(_) => true, // Cells are always truthy
         }
     }
@@ -190,7 +211,9 @@ impl PyTrait for HeapData {
             Self::List(l) => l.py_repr_fmt(f, heap, heap_ids, interns),
             Self::Tuple(t) => t.py_repr_fmt(f, heap, heap_ids, interns),
             Self::Dict(d) => d.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::Closure(f_id, _) => interns.get_function(*f_id).py_repr_fmt(f, interns, 0),
+            Self::Closure(f_id, _, _) | Self::FunctionDefaults(f_id, _) => {
+                interns.get_function(*f_id).py_repr_fmt(f, interns, 0)
+            }
             // Cell repr shows the contained value's type
             Self::Cell(v) => write!(f, "<cell: {} object>", v.py_type(Some(heap))),
         }
@@ -338,7 +361,8 @@ impl HashState {
             | HeapData::Bytes(_)
             | HeapData::Tuple(_)
             | HeapData::Cell(_)
-            | HeapData::Closure(_, _) => Self::Unknown,
+            | HeapData::Closure(_, _, _)
+            | HeapData::FunctionDefaults(_, _) => Self::Unknown,
             HeapData::List(_) | HeapData::Dict(_) => Self::Unhashable,
         }
     }
@@ -1032,10 +1056,24 @@ impl<T: ResourceTracker> Heap<T> {
                     }
                 }
             }
-            HeapData::Closure(_, children) => {
-                // Decrement ref count for each captured cell
-                for child_id in children {
-                    work_list.push(*child_id);
+            HeapData::Closure(_, cells, defaults) => {
+                // Add captured cells to work list
+                for cell_id in cells {
+                    work_list.push(*cell_id);
+                }
+                // Add default values that are heap references
+                for default in defaults {
+                    if let Value::Ref(id) = default {
+                        work_list.push(*id);
+                    }
+                }
+            }
+            HeapData::FunctionDefaults(_, defaults) => {
+                // Add default values that are heap references
+                for default in defaults {
+                    if let Value::Ref(id) = default {
+                        work_list.push(*id);
+                    }
                 }
             }
             HeapData::Cell(value) => {

@@ -302,6 +302,59 @@ fn kitchen_sink_cpython(bench: &mut Bencher) {
     });
 }
 
+// language=Python
+const FUNC_CALL_KWARGS_CODE: &str = "
+def add(a, b=2):
+    return a + b
+
+add(a=1)
+";
+
+/// Benchmarks function call with keyword arguments using Monty interpreter
+fn func_call_kwargs_monty(bench: &mut Bencher) {
+    let ex = Executor::new(FUNC_CALL_KWARGS_CODE, "test.py", &[]).unwrap();
+    let r = ex.run_no_limits(vec![]).unwrap();
+    let int_value: i64 = r.as_ref().try_into().unwrap();
+    assert_eq!(int_value, 3);
+
+    bench.iter(|| {
+        let r = ex.run_no_limits(vec![]).unwrap();
+        let int_value: i64 = r.as_ref().try_into().unwrap();
+        black_box(int_value);
+    });
+}
+
+/// Benchmarks function call with keyword arguments using CPython
+fn func_call_kwargs_cpython(bench: &mut Bencher) {
+    Python::with_gil(|py| {
+        let fun: PyObject = PyModule::from_code(
+            py,
+            // language=Python
+            "def main():
+                def add(a, b=2):
+                    return a + b
+                return add(a=1)
+            ",
+            "test.py",
+            "main",
+        )
+        .unwrap()
+        .getattr("main")
+        .unwrap()
+        .into();
+
+        let r_py = fun.call0(py).unwrap();
+        let r: i64 = r_py.extract(py).unwrap();
+        assert_eq!(r, 3);
+
+        bench.iter(|| {
+            let r_py = fun.call0(py).unwrap();
+            let r: i64 = r_py.extract(py).unwrap();
+            black_box(r);
+        });
+    });
+}
+
 /// Configures all benchmark groups
 fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("add_two");
@@ -332,6 +385,11 @@ fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("kitchen_sink");
     group.bench_function("monty", kitchen_sink_monty);
     group.bench_function("cpython", kitchen_sink_cpython);
+    group.finish();
+
+    let mut group = c.benchmark_group("func_call_kwargs");
+    group.bench_function("monty", func_call_kwargs_monty);
+    group.bench_function("cpython", func_call_kwargs_cpython);
     group.finish();
 }
 

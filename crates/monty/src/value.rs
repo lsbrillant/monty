@@ -19,7 +19,7 @@ use crate::resource::ResourceTracker;
 use crate::run_frame::RunResult;
 use crate::types::bytes::bytes_repr_fmt;
 use crate::types::str::string_repr_fmt;
-use crate::types::PyTrait;
+use crate::types::{Dict, PyTrait};
 
 /// Primary value type representing Python objects at runtime.
 ///
@@ -1121,6 +1121,63 @@ impl Value {
     pub fn dec_ref_forget(&mut self) {
         let old = std::mem::replace(self, Value::Dereferenced);
         std::mem::forget(old);
+    }
+
+    /// Convert a Value into a Dict reference.
+    ///
+    /// The returned reference borrows from the heap. Note that this method
+    /// consumes `self` but does NOT handle reference counting - the caller
+    /// must ensure proper cleanup if needed.
+    pub fn into_dict(self, heap: &mut Heap<impl ResourceTracker>) -> Result<&Dict, &'static str> {
+        let Value::Ref(id) = self else {
+            return Err("into_dict, value must be a Ref");
+        };
+        match heap.get(id) {
+            HeapData::Dict(dict) => Ok(dict),
+            _ => Err("into_dict, value must be a Dict"),
+        }
+    }
+
+    /// Converts the value into a keyword string representation if possible.
+    ///
+    /// Returns `Some(KeywordStr)` for `InternString` values or heap `str`
+    /// objects, otherwise returns `None`.
+    pub fn as_either_str<T: ResourceTracker>(&self, heap: &mut Heap<T>) -> Option<EitherStr> {
+        match self {
+            Value::InternString(id) => Some(EitherStr::Interned(*id)),
+            Value::Ref(heap_id) => match heap.get(*heap_id) {
+                HeapData::Str(s) => Some(EitherStr::Heap(s.as_str().to_owned())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+/// Interned or heap-owned string identifier.
+#[derive(Debug, Clone)]
+pub enum EitherStr {
+    /// Interned string identifier (cheap comparisons and no allocation).
+    Interned(StringId),
+    /// Heap-owned string extracted from a `str` object.
+    Heap(String),
+}
+
+impl EitherStr {
+    /// Returns the keyword as a str slice for error messages or comparisons.
+    pub fn as_str<'a>(&'a self, interns: &'a Interns) -> &'a str {
+        match self {
+            Self::Interned(id) => interns.get_str(*id),
+            Self::Heap(s) => s.as_str(),
+        }
+    }
+
+    /// Checks whether this keyword matches the given interned identifier.
+    pub fn matches(&self, target: StringId, interns: &Interns) -> bool {
+        match self {
+            Self::Interned(id) => *id == target,
+            Self::Heap(s) => s == interns.get_str(target),
+        }
     }
 }
 

@@ -11,8 +11,9 @@ use crate::function::Function;
 use crate::intern::{FunctionId, InternerBuilder, StringId};
 use crate::namespace::NamespaceId;
 use crate::operators::{CmpOperator, Operator};
-use crate::parse::{ParseNode, ParseResult};
+use crate::parse::{ParseNode, ParseResult, ParsedSignature};
 use crate::parse_error::ParseError;
+use crate::signature::Signature;
 
 /// Result of the prepare phase, containing everything needed to execute code.
 ///
@@ -275,7 +276,7 @@ impl<'i> Prepare<'i> {
                                 Expr::Builtin(b) => {
                                     let call_expr = Expr::Call {
                                         callable: Callable::Builtin(b),
-                                        args: ArgExprs::Zero,
+                                        args: ArgExprs::Empty,
                                     };
                                     Some(ExprLoc::new(expr.position, call_expr))
                                 }
@@ -352,8 +353,8 @@ impl<'i> Prepare<'i> {
                     let or_else = self.prepare_nodes(or_else)?;
                     new_nodes.push(Node::If { test, body, or_else });
                 }
-                ParseNode::FunctionDef { name, params, body } => {
-                    let func_node = self.prepare_function_def(name, params, body)?;
+                ParseNode::FunctionDef { name, signature, body } => {
+                    let func_node = self.prepare_function_def(name, signature, body)?;
                     new_nodes.push(func_node);
                 }
                 ParseNode::Global(names) => {
@@ -570,14 +571,17 @@ impl<'i> Prepare<'i> {
     fn prepare_function_def(
         &mut self,
         name: Identifier,
-        params: Vec<StringId>,
+        parsed_sig: ParsedSignature,
         body: Vec<ParseNode>,
     ) -> Result<Node, ParseError> {
         // Register the function name in the current scope
         let (name, _) = self.get_id(name);
 
+        // Extract param names from the parsed signature for scope analysis
+        let param_names: Vec<StringId> = parsed_sig.param_names().collect();
+
         // Pass 1: Collect scope information from the function body
-        let scope_info = collect_function_scope_info(&body, &params, self.interner);
+        let scope_info = collect_function_scope_info(&body, &param_names, self.interner);
 
         // Get the global name map to pass to the function preparer
         // At module level, use our own name_map; otherwise use the inherited global_name_map
@@ -606,7 +610,7 @@ impl<'i> Prepare<'i> {
         // Pass 2: Create child preparer for function body with scope info
         let mut inner_prepare = Prepare::new_function(
             body.len(),
-            &params,
+            &param_names,
             scope_info.assigned_names,
             scope_info.global_names,
             scope_info.nonlocal_names,
@@ -667,14 +671,64 @@ impl<'i> Prepare<'i> {
         // Slots are implicitly params.len()..params.len()+cell_var_count in the namespace layout
         let cell_var_count = inner_prepare.cell_var_map.len();
         let namespace_size = inner_prepare.namespace_size;
+
+        // Build the runtime Signature from the parsed signature
+        let pos_args: Vec<StringId> = parsed_sig.pos_args.iter().map(|p| p.name).collect();
+        let pos_defaults_count = parsed_sig.pos_args.iter().filter(|p| p.default.is_some()).count();
+        let args: Vec<StringId> = parsed_sig.args.iter().map(|p| p.name).collect();
+        let arg_defaults_count = parsed_sig.args.iter().filter(|p| p.default.is_some()).count();
+        let mut kwargs: Vec<StringId> = Vec::with_capacity(parsed_sig.kwargs.len());
+        let mut kwarg_default_map: Vec<Option<usize>> = Vec::with_capacity(parsed_sig.kwargs.len());
+        let mut kwarg_default_index = 0;
+        for param in &parsed_sig.kwargs {
+            kwargs.push(param.name);
+            if param.default.is_some() {
+                kwarg_default_map.push(Some(kwarg_default_index));
+                kwarg_default_index += 1;
+            } else {
+                kwarg_default_map.push(None);
+            }
+        }
+
+        let signature = Signature::new(
+            pos_args,
+            pos_defaults_count,
+            args,
+            arg_defaults_count,
+            parsed_sig.var_args,
+            kwargs,
+            kwarg_default_map,
+            parsed_sig.var_kwargs,
+        );
+
+        // Collect and prepare default expressions in order: pos_args -> args -> kwargs
+        // Only includes parameters that actually have defaults.
+        let mut default_exprs = Vec::with_capacity(signature.total_defaults_count());
+        for param in &parsed_sig.pos_args {
+            if let Some(ref expr) = param.default {
+                default_exprs.push(self.prepare_expression(expr.clone())?);
+            }
+        }
+        for param in &parsed_sig.args {
+            if let Some(ref expr) = param.default {
+                default_exprs.push(self.prepare_expression(expr.clone())?);
+            }
+        }
+        for param in &parsed_sig.kwargs {
+            if let Some(ref expr) = param.default {
+                default_exprs.push(self.prepare_expression(expr.clone())?);
+            }
+        }
+
         let function_id = FunctionId::new(self.functions.len());
         self.functions.push(Function::new(
             name,
-            params,
+            signature,
             prepared_body,
             namespace_size,
             free_var_enclosing_slots,
             cell_var_count,
+            default_exprs,
         ));
 
         // Return the final FunctionDef node
@@ -1016,15 +1070,18 @@ fn collect_cell_vars_from_node(
     interner: &InternerBuilder,
 ) {
     match node {
-        ParseNode::FunctionDef { params, body, .. } => {
+        ParseNode::FunctionDef { signature, body, .. } => {
             // Find what names are referenced inside this nested function
             let mut referenced = AHashSet::new();
             for n in body {
                 collect_referenced_names_from_node(n, &mut referenced, interner);
             }
 
+            // Extract param names from signature for scope analysis
+            let param_names: Vec<StringId> = signature.param_names().collect();
+
             // Collect the nested function's own locals (params + assigned)
-            let nested_scope = collect_function_scope_info(body, params, interner);
+            let nested_scope = collect_function_scope_info(body, &param_names, interner);
 
             // Any name that is:
             // - Referenced by the nested function
@@ -1034,7 +1091,7 @@ fn collect_cell_vars_from_node(
             // becomes a cell_var
             for name in &referenced {
                 if !nested_scope.assigned_names.contains(name)
-                    && !params.iter().any(|p| interner.get_str(*p) == name)
+                    && !param_names.iter().any(|p| interner.get_str(*p) == name)
                     && !nested_scope.global_names.contains(name)
                     && our_locals.contains(name)
                 {
@@ -1191,7 +1248,7 @@ fn collect_referenced_names_from_args(
 ) {
     use crate::args::ArgExprs;
     match args {
-        ArgExprs::Zero => {}
+        ArgExprs::Empty => {}
         ArgExprs::One(e) => collect_referenced_names_from_expr(e, referenced, interner),
         ArgExprs::Two(e1, e2) => {
             collect_referenced_names_from_expr(e1, referenced, interner);

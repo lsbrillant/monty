@@ -40,6 +40,8 @@ Avoid local imports, unless there's a very good reason, all imports should be at
 
 Avoid `fn my_func<T: MyTrait>(..., param: T)` style function definitions, STRONGLY prefer `fn my_func(param: impl MyTrait)` syntax since changes are more localized. This includes in trait definitions and implementations.
 
+Also avoid using functions and structs via a path like `std::borrow::Cow::Owned(...)`, instead import `Cow` globally with `use std::borrow::Cow;`.
+
 ### Docstrings and comments.
 
 IMPORTANT: every struct, enum and function should be a comprehensive but concise docstring to
@@ -81,9 +83,11 @@ cargo run -- <file.py>
 
 ### Test File Structure
 
+Most functionality should be tested via python files in the `crates/monty/test_cases` directory.
+
 **DO NOT create many small test files.** This would be unmaintainable.
 
-ALWAYS consolidate related tests into single files*using multiple `assert` statements. Follow `test_cases/fstring__all.py` as the gold standard pattern:
+ALWAYS consolidate related tests into single files using multiple `assert` statements. Follow `crates/monty/test_cases/fstring__all.py` as the gold standard pattern:
 
 ```python
 # === Section name ===
@@ -131,11 +135,13 @@ Do NOT use `# Return=` when you could use `assert` instead
 
 ### Skip Directive
 
+NEVER SKIP TESTS UNLESS ABSOLUTELY NECESSARY AND EXPLICITLY APPROVED BY ME!!!
+
 Optional, on first line of file - DO NOT use unless absolutely necessary:
 - `# skip=cpython` - Skip CPython test (only run on Monty)
 - `# skip=monty` - Skip Monty test (only run on CPython)
 
-Ask for approval before using `skip`!
+NEVER SKIP TESTS UNLESS ABSOLUTELY NECESSARY AND EXPLICITLY APPROVED BY ME!!!
 
 ### Other Notes
 

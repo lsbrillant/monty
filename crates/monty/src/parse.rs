@@ -4,7 +4,7 @@ use std::fmt;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::{
     self as ast, BoolOp, CmpOp, ConversionFlag as RuffConversionFlag, ElifElseClause, Expr as AstExpr,
-    InterpolatedStringElement, Keyword, Number, Operator as AstOperator, Stmt, UnaryOp,
+    InterpolatedStringElement, Keyword, Number, Operator as AstOperator, ParameterWithDefault, Stmt, UnaryOp,
 };
 use ruff_python_parser::parse_module;
 use ruff_text_size::TextRange;
@@ -18,6 +18,49 @@ use crate::fstring::{ConversionFlag, FStringPart, FormatSpec};
 use crate::intern::{InternerBuilder, StringId};
 use crate::operators::{CmpOperator, Operator};
 use crate::parse_error::ParseError;
+
+/// A parameter in a function signature with optional default value.
+#[derive(Debug, Clone)]
+pub struct ParsedParam {
+    /// The parameter name.
+    pub name: StringId,
+    /// The default value expression (evaluated at definition time).
+    pub default: Option<ExprLoc>,
+}
+
+/// A parsed function signature with all parameter types.
+///
+/// This intermediate representation captures the structure of Python function
+/// parameters before name resolution. Default value expressions are stored
+/// as unevaluated AST and will be evaluated during the prepare phase.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedSignature {
+    /// Positional-only parameters (before `/`).
+    pub pos_args: Vec<ParsedParam>,
+    /// Positional-or-keyword parameters.
+    pub args: Vec<ParsedParam>,
+    /// Variable positional parameter (`*args`).
+    pub var_args: Option<StringId>,
+    /// Keyword-only parameters (after `*` or `*args`).
+    pub kwargs: Vec<ParsedParam>,
+    /// Variable keyword parameter (`**kwargs`).
+    pub var_kwargs: Option<StringId>,
+}
+
+impl ParsedSignature {
+    /// Returns an iterator over all parameter names in the signature.
+    ///
+    /// Order: pos_args, args, var_args, kwargs, var_kwargs
+    pub fn param_names(&self) -> impl Iterator<Item = StringId> + '_ {
+        self.pos_args
+            .iter()
+            .map(|p| p.name)
+            .chain(self.args.iter().map(|p| p.name))
+            .chain(self.var_args.iter().copied())
+            .chain(self.kwargs.iter().map(|p| p.name))
+            .chain(self.var_kwargs.iter().copied())
+    }
+}
 
 /// Parsed AST node, intermediate representation between ruff AST and prepared nodes.
 ///
@@ -61,7 +104,7 @@ pub enum ParseNode {
     },
     FunctionDef {
         name: Identifier,
-        params: Vec<StringId>,
+        signature: ParsedSignature,
         body: Vec<ParseNode>,
     },
     /// Global variable declaration.
@@ -179,32 +222,36 @@ impl<'a> Parser<'a> {
                     return Err(not_implemented("async function definitions"));
                 }
 
-                // Reject unsupported features
-                if function.parameters.vararg.is_some() {
-                    return Err(not_implemented("*args (variadic positional arguments)"));
-                } else if function.parameters.kwarg.is_some() {
-                    return Err(not_implemented("**kwargs (variadic keyword arguments)"));
-                } else if !function.parameters.kwonlyargs.is_empty() {
-                    return Err(not_implemented("keyword-only arguments"));
-                } else if !function.parameters.posonlyargs.is_empty() {
-                    return Err(not_implemented("positional-only arguments"));
-                }
+                let params = &function.parameters;
 
-                // Parse parameters - only positional without defaults
-                let mut params = Vec::with_capacity(function.parameters.args.len());
-                for param in &function.parameters.args {
-                    // Reject default argument values
-                    if param.default.is_some() {
-                        return Err(not_implemented("default argument values"));
-                    }
-                    params.push(self.interner.intern(&self.code[param.parameter.name.range]));
-                }
+                // Parse positional-only parameters (before /)
+                let pos_args = self.parse_params_with_defaults(&params.posonlyargs)?;
+
+                // Parse positional-or-keyword parameters
+                let args = self.parse_params_with_defaults(&params.args)?;
+
+                // Parse *args
+                let var_args = params.vararg.as_ref().map(|p| self.interner.intern(&p.name.id));
+
+                // Parse keyword-only parameters (after * or *args)
+                let kwargs = self.parse_params_with_defaults(&params.kwonlyargs)?;
+
+                // Parse **kwargs
+                let var_kwargs = params.kwarg.as_ref().map(|p| self.interner.intern(&p.name.id));
+
+                let signature = ParsedSignature {
+                    pos_args,
+                    args,
+                    var_args,
+                    kwargs,
+                    var_kwargs,
+                };
 
                 let name = self.identifier(function.name.id, function.name.range);
                 // Parse function body recursively
                 let body = self.parse_statements(function.body)?;
 
-                Ok(ParseNode::FunctionDef { name, params, body })
+                Ok(ParseNode::FunctionDef { name, signature, body })
             }
             Stmt::ClassDef(_) => Err(not_implemented("class definitions")),
             Stmt::Return(ast::StmtReturn { value, .. }) => match value {
@@ -435,17 +482,30 @@ impl<'a> Parser<'a> {
                 func, arguments, range, ..
             }) => {
                 let ast::Arguments { args, keywords, .. } = arguments;
-                let args = args
-                    .into_vec()
-                    .into_iter()
-                    .map(|f| self.parse_expression(f))
-                    .collect::<Result<Vec<_>, ParseError>>()?;
-                let kwargs = keywords
-                    .into_vec()
-                    .into_iter()
-                    .map(|f| self.parse_kwargs(f))
-                    .collect::<Result<Vec<_>, ParseError>>()?;
-                let args = ArgExprs::new(args, kwargs);
+                let mut positional_args = Vec::new();
+                let mut var_args_expr: Option<ExprLoc> = None;
+                let mut seen_star = false;
+
+                for arg_expr in args.into_vec() {
+                    match arg_expr {
+                        AstExpr::Starred(ast::ExprStarred { value, .. }) => {
+                            if var_args_expr.is_some() {
+                                return Err(not_implemented("multiple *args unpacking"));
+                            }
+                            var_args_expr = Some(self.parse_expression(*value)?);
+                            seen_star = true;
+                        }
+                        other => {
+                            if seen_star {
+                                return Err(not_implemented("positional arguments after *args unpacking"));
+                            }
+                            positional_args.push(self.parse_expression(other)?);
+                        }
+                    }
+                }
+                // Separate regular kwargs (key=value) from var_kwargs (**expr)
+                let (kwargs, var_kwargs) = self.parse_keywords(keywords.into_vec())?;
+                let args = ArgExprs::new_with_var_kwargs(positional_args, var_args_expr, kwargs, var_kwargs);
                 let position = self.convert_range(range);
                 match *func {
                     AstExpr::Name(ast::ExprName { id, range, .. }) => {
@@ -560,13 +620,30 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_kwargs(&mut self, kwarg: Keyword) -> Result<Kwarg, ParseError> {
-        let key = match kwarg.arg {
-            Some(key) => self.identifier(key.id, key.range),
-            None => return Err(not_implemented("keyword argument unpacking (**expr)")),
-        };
-        let value = self.parse_expression(kwarg.value)?;
-        Ok(Kwarg { key, value })
+    /// Parses keyword arguments, separating regular kwargs from var_kwargs (`**expr`).
+    ///
+    /// Returns `(kwargs, var_kwargs)` where kwargs is a vec of named keyword arguments
+    /// and var_kwargs is an optional expression for `**expr` unpacking.
+    fn parse_keywords(&mut self, keywords: Vec<Keyword>) -> Result<(Vec<Kwarg>, Option<ExprLoc>), ParseError> {
+        let mut kwargs = Vec::new();
+        let mut var_kwargs = None;
+
+        for kwarg in keywords {
+            if let Some(key) = kwarg.arg {
+                // Regular kwarg: key=value
+                let key = self.identifier(key.id, key.range);
+                let value = self.parse_expression(kwarg.value)?;
+                kwargs.push(Kwarg { key, value });
+            } else {
+                // Var kwargs: **expr
+                if var_kwargs.is_some() {
+                    return Err(not_implemented("multiple **kwargs unpacking"));
+                }
+                var_kwargs = Some(self.parse_expression(kwarg.value)?);
+            }
+        }
+
+        Ok((kwargs, var_kwargs))
     }
 
     fn parse_identifier(&mut self, ast: AstExpr) -> Result<Identifier, ParseError> {
@@ -579,6 +656,25 @@ impl<'a> Parser<'a> {
     fn identifier(&mut self, id: Name, range: TextRange) -> Identifier {
         let string_id = self.interner.intern(&id);
         Identifier::new(string_id, self.convert_range(range))
+    }
+
+    /// Parses function parameters with optional default values.
+    ///
+    /// Handles parameters like `a`, `b=10`, `c=None` by extracting the parameter
+    /// name and parsing any default expression. Default expressions are stored
+    /// as unevaluated AST and will be evaluated during the prepare phase.
+    fn parse_params_with_defaults(&mut self, params: &[ParameterWithDefault]) -> Result<Vec<ParsedParam>, ParseError> {
+        params
+            .iter()
+            .map(|p| {
+                let name = self.interner.intern(&p.parameter.name.id);
+                let default = match &p.default {
+                    Some(expr) => Some(self.parse_expression((**expr).clone())?),
+                    None => None,
+                };
+                Ok(ParsedParam { name, default })
+            })
+            .collect()
     }
 
     /// Parses an f-string value into expression parts.

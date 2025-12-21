@@ -285,16 +285,20 @@ impl Executor {
                 let py_object = PyObject::new(return_value, &mut heap, &self.interns);
                 Ok(ExecProgress::Complete(py_object))
             }
-            Some(FrameExit::ExternalCall(ExternalCall { function_id, args })) => Ok(ExecProgress::FunctionCall {
-                function_name: self.interns.get_external_function_name(function_id),
-                args: args.into_py_objects(&mut heap, &self.interns),
-                state: FunctionCallExecutorState {
-                    executor: self,
-                    heap,
-                    namespaces,
-                    position_stack: position_tracker.stack,
-                },
-            }),
+            Some(FrameExit::ExternalCall(ExternalCall { function_id, args })) => {
+                let (args, kwargs) = args.into_py_objects(&mut heap, &self.interns);
+                Ok(ExecProgress::FunctionCall {
+                    function_name: self.interns.get_external_function_name(function_id),
+                    args,
+                    kwargs,
+                    state: FunctionCallExecutorState {
+                        executor: self,
+                        heap,
+                        namespaces,
+                        position_stack: position_tracker.stack,
+                    },
+                })
+            }
         }
     }
 }
@@ -337,8 +341,10 @@ pub enum ExecProgress<T: ResourceTracker> {
     FunctionCall {
         /// The name of the function being called.
         function_name: String,
-        /// The arguments passed to the function.
+        /// The positional arguments passed to the function.
         args: Vec<PyObject>,
+        /// The keyword arguments passed to the function (key, value pairs).
+        kwargs: Vec<(PyObject, PyObject)>,
         /// The execution state that can be resumed with a return value.
         state: FunctionCallExecutorState<T>,
     },
@@ -348,13 +354,24 @@ pub enum ExecProgress<T: ResourceTracker> {
 
 impl<T: ResourceTracker> ExecProgress<T> {
     /// Consumes the `ExecProgress` and returns external function call info and state.
-    pub fn into_function_call(self) -> Option<(String, Vec<PyObject>, FunctionCallExecutorState<T>)> {
+    ///
+    /// Returns (function_name, positional_args, keyword_args, state).
+    #[allow(clippy::type_complexity)]
+    pub fn into_function_call(
+        self,
+    ) -> Option<(
+        String,
+        Vec<PyObject>,
+        Vec<(PyObject, PyObject)>,
+        FunctionCallExecutorState<T>,
+    )> {
         match self {
             ExecProgress::FunctionCall {
                 function_name,
                 args,
+                kwargs,
                 state,
-            } => Some((function_name, args, state)),
+            } => Some((function_name, args, kwargs, state)),
             ExecProgress::Complete(_) => None,
         }
     }

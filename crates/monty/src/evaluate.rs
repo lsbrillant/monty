@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
 
-use crate::args::{ArgExprs, ArgValues};
-use crate::exceptions::{internal_err, InternalRunError, SimpleException};
+use crate::args::{ArgExprs, ArgValues, Kwarg, KwargsValues};
+use crate::callable::Callable;
+use crate::exceptions::{exc_err_fmt, internal_err, ExcType, InternalRunError, SimpleException};
 use crate::expressions::{Expr, ExprLoc, Identifier, NameScope};
 use crate::fstring::{fstring_interpolation, FStringPart};
 
 use crate::heap::{Heap, HeapData};
-use crate::intern::{ExtFunctionId, Interns};
+use crate::intern::{ExtFunctionId, Interns, StringId};
 use crate::io::PrintWriter;
 use crate::namespace::{NamespaceId, Namespaces};
 use crate::operators::{CmpOperator, Operator};
@@ -92,7 +93,7 @@ impl<'h, 's, T: ResourceTracker, W: PrintWriter> EvaluateExpr<'h, 's, T, W> {
                 .get_var_value(self.local_idx, self.heap, ident, self.interns)
                 .map(EvalResult::Value),
             Expr::Call { callable, args } => {
-                let args = return_ext_call!(self.evaluate_args(args)?);
+                let args = return_ext_call!(self.evaluate_args(args, Some(callable))?);
                 callable.call(
                     self.namespaces,
                     self.local_idx,
@@ -216,7 +217,7 @@ impl<'h, 's, T: ResourceTracker, W: PrintWriter> EvaluateExpr<'h, 's, T, W> {
                 }
             }
             Expr::Call { callable, args } => {
-                let args = return_ext_call!(self.evaluate_args(args)?);
+                let args = return_ext_call!(self.evaluate_args(args, Some(callable))?);
                 let eval_result = callable.call(
                     self.namespaces,
                     self.local_idx,
@@ -445,7 +446,8 @@ impl<'h, 's, T: ResourceTracker, W: PrintWriter> EvaluateExpr<'h, 's, T, W> {
     /// and handles proper cleanup of temporary values.
     fn attr_call(&mut self, object_ident: &Identifier, attr: &Attr, args: &ArgExprs) -> RunResult<EvalResult<Value>> {
         // Evaluate arguments first to avoid borrow conflicts
-        let args = return_ext_call!(self.evaluate_args(args)?);
+        // Note: we pass None for callable since method calls don't have a simple function name
+        let args = return_ext_call!(self.evaluate_args(args, None)?);
 
         // For Cell scope, look up the cell from the namespace and dereference
         if let NameScope::Cell = object_ident.scope {
@@ -514,43 +516,348 @@ impl<'h, 's, T: ResourceTracker, W: PrintWriter> EvaluateExpr<'h, 's, T, W> {
     }
 
     /// Evaluates function call arguments from expressions to values.
-    fn evaluate_args(&mut self, args_expr: &ArgExprs) -> RunResult<EvalResult<ArgValues>> {
+    ///
+    /// The `callable` parameter is used for error messages when argument unpacking fails.
+    /// Pass `None` for method calls where the callable name isn't readily available.
+    fn evaluate_args(&mut self, args_expr: &ArgExprs, callable: Option<&Callable>) -> RunResult<EvalResult<ArgValues>> {
         match args_expr {
-            ArgExprs::Zero => Ok(EvalResult::Value(ArgValues::Zero)),
+            ArgExprs::Empty => Ok(EvalResult::Value(ArgValues::Empty)),
             ArgExprs::One(arg) => {
                 let arg = return_ext_call!(self.evaluate_use(arg)?);
                 Ok(EvalResult::Value(ArgValues::One(arg)))
             }
             ArgExprs::Two(arg1, arg2) => {
-                let arg1 = return_ext_call!(self.evaluate_use(arg1)?);
-                // If evaluating arg2 triggers an external call, clean up arg1 first
-                let arg2 = match self.evaluate_use(arg2)? {
-                    EvalResult::Value(v) => v,
+                let first = return_ext_call!(self.evaluate_use(arg1)?);
+                match self.evaluate_use(arg2)? {
+                    EvalResult::Value(second) => Ok(EvalResult::Value(ArgValues::Two(first, second))),
                     EvalResult::ExternalCall(ext_call) => {
-                        arg1.drop_with_heap(self.heap);
-                        return Ok(EvalResult::ExternalCall(ext_call));
+                        first.drop_with_heap(self.heap);
+                        Ok(EvalResult::ExternalCall(ext_call))
                     }
-                };
-                Ok(EvalResult::Value(ArgValues::Two(arg1, arg2)))
+                }
             }
             ArgExprs::Args(args_exprs) => {
-                let mut args: Vec<Value> = Vec::with_capacity(args_exprs.len());
-                for arg_expr in args_exprs {
-                    // If an external call is triggered, clean up all evaluated args first
-                    let arg = match self.evaluate_use(arg_expr)? {
-                        EvalResult::Value(v) => v,
-                        EvalResult::ExternalCall(ext_call) => {
-                            for arg in args {
-                                arg.drop_with_heap(self.heap);
-                            }
-                            return Ok(EvalResult::ExternalCall(ext_call));
-                        }
-                    };
-                    args.push(arg);
-                }
-                Ok(EvalResult::Value(ArgValues::Many(args)))
+                let args = return_ext_call!(self.evaluate_pos_args(args_exprs)?);
+                Ok(EvalResult::Value(ArgValues::ArgsKargs {
+                    args,
+                    kwargs: KwargsValues::Empty,
+                }))
             }
-            _ => todo!("Implement evaluation for kwargs"),
+            ArgExprs::Kwargs(kwargs_exprs) => {
+                let inline = return_ext_call!(self.evaluate_kwargs(kwargs_exprs)?);
+                Ok(EvalResult::Value(ArgValues::Kwargs(KwargsValues::Inline(inline))))
+            }
+            ArgExprs::ArgsKargs {
+                args,
+                var_args,
+                kwargs,
+                var_kwargs,
+            } => self.evaluate_full_args(
+                args.as_deref(),
+                var_args.as_deref(),
+                kwargs.as_deref(),
+                var_kwargs.as_deref(),
+                callable.map(|c| c.name(self.interns)),
+            ),
+        }
+    }
+
+    /// Collects positional arguments into a vector of evaluated values.
+    ///
+    /// If evaluation of any argument fails or yields an external call, all previously
+    /// evaluated arguments are dropped to maintain correct reference counts.
+    fn evaluate_pos_args(&mut self, exprs: &[ExprLoc]) -> RunResult<EvalResult<Vec<Value>>> {
+        let mut args: Vec<Value> = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            match self.evaluate_use(expr) {
+                Ok(EvalResult::Value(value)) => args.push(value),
+                Ok(EvalResult::ExternalCall(ext_call)) => {
+                    self.drop_values(&mut args);
+                    return Ok(EvalResult::ExternalCall(ext_call));
+                }
+                Err(err) => {
+                    self.drop_values(&mut args);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(EvalResult::Value(args))
+    }
+
+    /// Builds fully general arguments supporting all Python call syntax.
+    ///
+    /// Evaluation order follows Python semantics:
+    /// 1. Positional arguments (left to right)
+    /// 2. `*args` iterable unpacking
+    /// 3. Keyword arguments and `**kwargs` dict unpacking
+    ///
+    /// On error or external call, all partially evaluated arguments are cleaned up.
+    /// The `args` parameter is passed to `build_kwargs` which takes ownership of cleanup
+    /// responsibility on error paths.
+    fn evaluate_full_args(
+        &mut self,
+        args_exprs: Option<&[ExprLoc]>,
+        var_args_expr: Option<&ExprLoc>,
+        kwargs_exprs: Option<&[Kwarg]>,
+        var_kwargs_expr: Option<&ExprLoc>,
+        callable_name: Option<&str>,
+    ) -> RunResult<EvalResult<ArgValues>> {
+        let mut args = if let Some(exprs) = args_exprs {
+            return_ext_call!(self.evaluate_pos_args(exprs)?)
+        } else {
+            Vec::new()
+        };
+
+        if let Some(var_args) = var_args_expr {
+            let value = match self.evaluate_use(var_args) {
+                Ok(EvalResult::Value(value)) => value,
+                Ok(EvalResult::ExternalCall(ext_call)) => {
+                    self.drop_values(&mut args);
+                    return Ok(EvalResult::ExternalCall(ext_call));
+                }
+                Err(err) => {
+                    self.drop_values(&mut args);
+                    return Err(err);
+                }
+            };
+
+            let ok = self.extend_args_from_iterable(&mut args, &value);
+            value.drop_with_heap(self.heap);
+            if !ok {
+                self.drop_values(&mut args);
+                return exc_err_fmt!(ExcType::TypeError; "argument after * must be an iterable");
+            }
+        }
+
+        let kwargs = return_ext_call!(self.build_kwargs(kwargs_exprs, var_kwargs_expr, callable_name, &mut args)?);
+
+        if args.is_empty() {
+            if kwargs.is_empty() {
+                Ok(EvalResult::Value(ArgValues::Empty))
+            } else {
+                Ok(EvalResult::Value(ArgValues::Kwargs(kwargs)))
+            }
+        } else {
+            Ok(EvalResult::Value(ArgValues::ArgsKargs { args, kwargs }))
+        }
+    }
+
+    /// Evaluates inline keyword arguments into `(StringId, Value)` pairs.
+    ///
+    /// Used for the simple case of `foo(a=1, b=2)` without `**kwargs` unpacking.
+    /// On error or external call, drops all previously evaluated kwargs.
+    fn evaluate_kwargs(&mut self, kwargs_exprs: &[Kwarg]) -> RunResult<EvalResult<Vec<(StringId, Value)>>> {
+        let mut inline = Vec::with_capacity(kwargs_exprs.len());
+        for kwarg in kwargs_exprs {
+            match self.evaluate_use(&kwarg.value) {
+                Ok(EvalResult::Value(value)) => inline.push((kwarg.key.name_id, value)),
+                Ok(EvalResult::ExternalCall(ext_call)) => {
+                    self.drop_inline_kwargs(&mut inline);
+                    return Ok(EvalResult::ExternalCall(ext_call));
+                }
+                Err(err) => {
+                    self.drop_inline_kwargs(&mut inline);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(EvalResult::Value(inline))
+    }
+
+    /// Copies items from an iterable heap object into `args`.
+    ///
+    /// Only supports `list` and `tuple` iterables. Returns `true` on success,
+    /// `false` if the value is not a supported iterable type.
+    fn extend_args_from_iterable(&mut self, args: &mut Vec<Value>, iterable: &Value) -> bool {
+        let Value::Ref(heap_id) = iterable else { return false };
+
+        // Two-phase copy: first collect values while heap is borrowed (copy_for_extend
+        // doesn't increment refcount), then increment refcounts after borrow ends.
+        // This avoids borrow conflicts between heap.get() and heap.inc_ref().
+        let copied_values: Vec<Value> = match self.heap.get(*heap_id) {
+            HeapData::Tuple(tuple) => tuple.as_vec().iter().map(Value::copy_for_extend).collect(),
+            HeapData::List(list) => list.as_vec().iter().map(Value::copy_for_extend).collect(),
+            _ => return false,
+        };
+
+        for value in &copied_values {
+            if let Value::Ref(id) = value {
+                self.heap.inc_ref(*id);
+            }
+        }
+        args.extend(copied_values);
+        true
+    }
+
+    /// Builds keyword arguments from inline kwargs and/or `**kwargs` unpacking.
+    ///
+    /// Takes ownership of `args` cleanup responsibility: on any error or external call,
+    /// this function will drop `args` before returning. On success, `args` is untouched.
+    fn build_kwargs(
+        &mut self,
+        inline_exprs: Option<&[Kwarg]>,
+        var_kwargs_expr: Option<&ExprLoc>,
+        callable_name: Option<&str>,
+        args: &mut Vec<Value>,
+    ) -> RunResult<EvalResult<KwargsValues>> {
+        if let Some(var_kwargs) = var_kwargs_expr {
+            return self.build_kwargs_from_mapping(inline_exprs, var_kwargs, callable_name, args);
+        }
+
+        if let Some(kwargs_exprs) = inline_exprs {
+            let mut inline = Vec::with_capacity(kwargs_exprs.len());
+            for kwarg in kwargs_exprs {
+                match self.evaluate_use(&kwarg.value) {
+                    Ok(EvalResult::Value(value)) => inline.push((kwarg.key.name_id, value)),
+                    Ok(EvalResult::ExternalCall(ext_call)) => {
+                        self.drop_values(args);
+                        self.drop_inline_kwargs(&mut inline);
+                        return Ok(EvalResult::ExternalCall(ext_call));
+                    }
+                    Err(err) => {
+                        self.drop_values(args);
+                        self.drop_inline_kwargs(&mut inline);
+                        return Err(err);
+                    }
+                }
+            }
+            return Ok(EvalResult::Value(KwargsValues::Inline(inline)));
+        }
+
+        Ok(EvalResult::Value(KwargsValues::Empty))
+    }
+
+    /// Builds keyword arguments when `**kwargs` dict unpacking is present.
+    ///
+    /// Merges the unpacked dict with any inline keyword arguments. Inline kwargs
+    /// take precedence and will error on duplicate keys (matching Python semantics).
+    ///
+    /// Like `build_kwargs`, takes ownership of `args` cleanup responsibility.
+    fn build_kwargs_from_mapping(
+        &mut self,
+        inline_exprs: Option<&[Kwarg]>,
+        var_kwargs_expr: &ExprLoc,
+        callable_name: Option<&str>,
+        args: &mut Vec<Value>,
+    ) -> RunResult<EvalResult<KwargsValues>> {
+        let var_kwargs_value = match self.evaluate_use(var_kwargs_expr) {
+            Ok(EvalResult::Value(value)) => value,
+            Ok(EvalResult::ExternalCall(ext_call)) => {
+                self.drop_values(args);
+                return Ok(EvalResult::ExternalCall(ext_call));
+            }
+            Err(err) => {
+                self.drop_values(args);
+                return Err(err);
+            }
+        };
+
+        let Value::Ref(heap_id) = &var_kwargs_value else {
+            let type_name = var_kwargs_value.py_type(Some(self.heap));
+            var_kwargs_value.drop_with_heap(self.heap);
+            self.drop_values(args);
+            return Err(ExcType::kwargs_type_error(callable_name, type_name).into());
+        };
+
+        let HeapData::Dict(dict) = self.heap.get(*heap_id) else {
+            let type_name = var_kwargs_value.py_type(Some(self.heap));
+            var_kwargs_value.drop_with_heap(self.heap);
+            self.drop_values(args);
+            return Err(ExcType::kwargs_type_error(callable_name, type_name).into());
+        };
+
+        // Two-phase copy pattern (see extend_args_from_iterable for explanation)
+        let copied_pairs: Vec<(Value, Value)> = dict
+            .iter_pairs()
+            .map(|(k, v)| (k.copy_for_extend(), v.copy_for_extend()))
+            .collect();
+
+        for (key, value) in &copied_pairs {
+            if let Value::Ref(id) = key {
+                self.heap.inc_ref(*id);
+            }
+            if let Value::Ref(id) = value {
+                self.heap.inc_ref(*id);
+            }
+        }
+
+        let mut kwargs = match Dict::from_pairs(copied_pairs, self.heap, self.interns) {
+            Ok(dict) => dict,
+            Err(err) => {
+                var_kwargs_value.drop_with_heap(self.heap);
+                self.drop_values(args);
+                return Err(err);
+            }
+        };
+        var_kwargs_value.drop_with_heap(self.heap);
+
+        // Merge inline kwargs into the dict, checking for duplicates
+        if let Some(kwargs_exprs) = inline_exprs {
+            for kwarg in kwargs_exprs {
+                let key = Value::InternString(kwarg.key.name_id);
+                let has_duplicate = match kwargs.get(&key, self.heap, self.interns) {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(err) => {
+                        self.drop_values(args);
+                        self.drop_dict(kwargs);
+                        return Err(err);
+                    }
+                };
+                if has_duplicate {
+                    let error = ExcType::duplicate_kwarg_error(callable_name, self.interns.get_str(kwarg.key.name_id));
+                    self.drop_values(args);
+                    self.drop_dict(kwargs);
+                    return Err(error.into());
+                }
+
+                let value = match self.evaluate_use(&kwarg.value) {
+                    Ok(EvalResult::Value(v)) => v,
+                    Ok(EvalResult::ExternalCall(ext_call)) => {
+                        self.drop_values(args);
+                        self.drop_dict(kwargs);
+                        return Ok(EvalResult::ExternalCall(ext_call));
+                    }
+                    Err(err) => {
+                        self.drop_values(args);
+                        self.drop_dict(kwargs);
+                        return Err(err);
+                    }
+                };
+                match kwargs.set(key, value, self.heap, self.interns) {
+                    Ok(Some(old_value)) => old_value.drop_with_heap(self.heap),
+                    Ok(None) => {}
+                    Err(err) => {
+                        self.drop_values(args);
+                        self.drop_dict(kwargs);
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Ok(EvalResult::Value(KwargsValues::Dict(kwargs)))
+    }
+
+    /// Drops positional arguments, ensuring each `Value` decrements its refcount.
+    fn drop_values(&mut self, values: &mut Vec<Value>) {
+        for value in values.drain(..) {
+            value.drop_with_heap(self.heap);
+        }
+    }
+
+    /// Drops inline kwargs, only releasing the stored value `Value`s.
+    fn drop_inline_kwargs(&mut self, inline: &mut Vec<(StringId, Value)>) {
+        for (_, value) in inline.drain(..) {
+            value.drop_with_heap(self.heap);
+        }
+    }
+
+    /// Drops all entries in a dict by consuming it.
+    fn drop_dict(&mut self, dict: Dict) {
+        for (key, value) in dict.into_vec() {
+            key.drop_with_heap(self.heap);
+            value.drop_with_heap(self.heap);
         }
     }
 }

@@ -57,10 +57,11 @@ impl Callable {
                 match value {
                     Value::Builtin(builtin) => return builtin.call(heap, args, interns, writer).map(EvalResult::Value),
                     Value::Function(f_id) => {
+                        // Simple function without defaults - pass empty slice
                         return interns
                             .get_function(*f_id)
-                            .call(namespaces, heap, args, interns, writer)
-                            .map(EvalResult::Value)
+                            .call(namespaces, heap, args, &[], interns, writer)
+                            .map(EvalResult::Value);
                     }
                     Value::ExtFunction(f_id) => {
                         let f_id = *f_id;
@@ -70,18 +71,31 @@ impl Callable {
                             Ok(EvalResult::ExternalCall(ExternalCall::new(f_id, args)))
                         };
                     }
-                    // Check for heap-allocated closure
+                    // Check for heap-allocated closure or function with defaults
                     Value::Ref(heap_id) => {
-                        let heap_data = heap.get(*heap_id);
-                        if let HeapData::Closure(f_id, cells) = heap_data {
-                            let f = interns.get_function(*f_id);
-                            // Clone the cells to release the borrow on heap_data before calling
-                            // call_with_cells will inc_ref when injecting into the new namespace
-                            let cells = cells.clone();
-                            return f
-                                .call_with_cells(namespaces, heap, args, &cells, interns, writer)
-                                .map(EvalResult::Value);
-                        }
+                        let heap_id = *heap_id;
+                        // Use with_entry_mut to temporarily take the HeapData out,
+                        // allowing us to borrow heap mutably for the function call
+                        return heap
+                            .with_entry_mut(heap_id, |heap, data| {
+                                match data {
+                                    HeapData::Closure(f_id, cells, defaults) => {
+                                        let f = interns.get_function(*f_id);
+                                        f.call_with_cells(namespaces, heap, args, cells, defaults, interns, writer)
+                                    }
+                                    HeapData::FunctionDefaults(f_id, defaults) => {
+                                        let f = interns.get_function(*f_id);
+                                        f.call(namespaces, heap, args, defaults, interns, writer)
+                                    }
+                                    _ => {
+                                        // Not a callable heap type
+                                        let type_name = data.py_type(Some(heap));
+                                        let err = exc_fmt!(ExcType::TypeError; "'{type_name}' object is not callable");
+                                        Err(err.with_position(ident.position).into())
+                                    }
+                                }
+                            })
+                            .map(EvalResult::Value);
                     }
                     _ => {}
                 }
@@ -107,6 +121,18 @@ impl Callable {
         match self {
             Self::Builtin(b) => b.py_type(),
             Self::Name(_) => "function",
+        }
+    }
+
+    /// Returns the callable name for error messages.
+    ///
+    /// For builtins, returns the builtin name (e.g., "print", "len") as a static str.
+    /// For named callables, returns the function name from interns.
+    pub fn name<'a>(&self, interns: &'a Interns) -> &'a str {
+        match self {
+            Self::Builtin(Builtins::Function(f)) => (*f).into(),
+            Self::Builtin(Builtins::ExcType(e)) => (*e).into(),
+            Self::Name(ident) => interns.get_str(ident.name_id),
         }
     }
 }

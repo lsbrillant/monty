@@ -109,3 +109,100 @@ for i in range(100):
     let result = ex.run_with_writer(vec![], &mut writer);
     assert!(result.is_ok());
 }
+
+// === print() kwargs tests ===
+
+#[test]
+fn print_custom_sep() {
+    let ex = Executor::new("print('a', 'b', 'c', sep='-')", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "a-b-c\n");
+}
+
+#[test]
+fn print_custom_end() {
+    let ex = Executor::new("print('hello', end='!')", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "hello!");
+}
+
+#[test]
+fn print_custom_sep_and_end() {
+    let ex = Executor::new("print('x', 'y', 'z', sep=', ', end='\\n---\\n')", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "x, y, z\n---\n");
+}
+
+#[test]
+fn print_empty_sep() {
+    let ex = Executor::new("print('a', 'b', 'c', sep='')", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "abc\n");
+}
+
+#[test]
+fn print_empty_end() {
+    let code = "print('first', end='')\nprint('second')";
+    let ex = Executor::new(code, "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "firstsecond\n");
+}
+
+#[test]
+fn print_sep_none() {
+    // sep=None should use default space
+    let ex = Executor::new("print('a', 'b', sep=None)", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    // In Python, sep=None means use default, but we treat it as empty string for simplicity
+    // This matches: print('a', 'b', sep=None) outputs "ab\n" with our impl
+    assert_eq!(writer.output(), "a b\n");
+}
+
+#[test]
+fn print_end_none() {
+    // end=None should use empty string (our interpretation)
+    let ex = Executor::new("print('hello', end=None)", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "hello\n");
+}
+
+#[test]
+fn print_flush_ignored() {
+    // flush=True should be accepted but ignored
+    let ex = Executor::new("print('test', flush=True)", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "test\n");
+}
+
+#[test]
+fn print_kwargs_dict() {
+    // Use a dict literal instead of dict() since dict builtin is not implemented
+    let ex = Executor::new("print('a', 'b', **{'sep': '-'})", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "a-b\n");
+}
+
+#[test]
+fn print_only_kwargs_no_args() {
+    let ex = Executor::new("print(sep='-', end='!')", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "!");
+}
+
+#[test]
+fn print_multiline_sep() {
+    let ex = Executor::new("print(1, 2, 3, sep='\\n')", "test.py", &[]).unwrap();
+    let mut writer = CollectStringPrint::new();
+    ex.run_with_writer(vec![], &mut writer).unwrap();
+    assert_eq!(writer.output(), "1\n2\n3\n");
+}

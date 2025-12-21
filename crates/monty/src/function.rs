@@ -2,15 +2,16 @@ use std::fmt::Write;
 
 use crate::{
     args::ArgValues,
-    exceptions::{ExcType, RunError, SimpleException, StackFrame},
-    expressions::{Identifier, Node},
+    exceptions::{ExcType, RunError, StackFrame},
+    expressions::{ExprLoc, Identifier, Node},
     heap::{Heap, HeapId},
-    intern::{Interns, StringId},
+    intern::Interns,
     io::PrintWriter,
     namespace::{NamespaceId, Namespaces},
     position::{FrameExit, NoPositionTracker},
     resource::ResourceTracker,
     run_frame::{RunFrame, RunResult},
+    signature::Signature,
     value::Value,
 };
 
@@ -26,8 +27,8 @@ use crate::{
 /// ```text
 /// [params...][cell_vars...][free_vars...][locals...]
 /// ```
-/// - Slots 0..params.len(): function parameters
-/// - Slots params.len()..params.len()+cell_var_count: cell refs for variables captured by nested functions
+/// - Slots 0..signature.param_count(): function parameters (see `Signature` for layout)
+/// - Slots after params: cell refs for variables captured by nested functions
 /// - Slots after cell_vars: free_var refs (captured from enclosing scope)
 /// - Remaining slots: local variables
 ///
@@ -42,8 +43,8 @@ use crate::{
 pub struct Function {
     /// The function name (used for error messages and repr).
     pub name: Identifier,
-    /// The function parameter names as interned StringIds.
-    pub params: Vec<StringId>,
+    /// The function signature.
+    pub signature: Signature,
     /// The prepared function body AST nodes.
     pub body: Vec<Node>,
     /// Size of the initial namespace (number of local variable slots).
@@ -58,6 +59,12 @@ pub struct Function {
     /// At call time, this many cells are created and pushed right after params.
     /// Their slots are implicitly params.len()..params.len()+cell_var_count.
     pub cell_var_count: usize,
+    /// Prepared default value expressions, evaluated at function definition time.
+    ///
+    /// Layout: `[pos_defaults...][arg_defaults...][kwarg_defaults...]`
+    /// Each group contains only the parameters that have defaults, in declaration order.
+    /// The counts in `signature` indicate how many defaults exist for each group.
+    pub default_exprs: Vec<ExprLoc>,
 }
 
 impl Function {
@@ -65,27 +72,36 @@ impl Function {
     ///
     /// # Arguments
     /// * `name` - The function name identifier
-    /// * `params` - The parameter names as interned StringIds
+    /// * `signature` - The function signature with parameter names and defaults
     /// * `body` - The prepared function body AST
     /// * `namespace_size` - Number of local variable slots needed
     /// * `free_var_enclosing_slots` - Enclosing namespace slots for captured variables
     /// * `cell_var_count` - Number of cells to create for variables captured by nested functions
+    /// * `default_exprs` - Prepared default value expressions for parameters
     pub fn new(
         name: Identifier,
-        params: Vec<StringId>,
+        signature: Signature,
         body: Vec<Node>,
         namespace_size: usize,
         free_var_enclosing_slots: Vec<NamespaceId>,
         cell_var_count: usize,
+        default_exprs: Vec<ExprLoc>,
     ) -> Self {
         Self {
             name,
-            params,
+            signature,
             body,
             namespace_size,
             free_var_enclosing_slots,
             cell_var_count,
+            default_exprs,
         }
+    }
+
+    /// Returns true if this function has any default parameter values.
+    #[must_use]
+    pub fn has_defaults(&self) -> bool {
+        !self.default_exprs.is_empty()
     }
 
     /// Returns true if this function has any free variables (is a closure).
@@ -110,6 +126,7 @@ impl Function {
     /// * `namespaces` - The namespace storage for managing all namespaces
     /// * `heap` - The heap for allocating objects
     /// * `args` - The arguments to pass to the function
+    /// * `defaults` - Evaluated default values for optional parameters
     /// * `interns` - String storage for looking up interned names in error messages
     /// * `writer` - The writer for print output
     pub fn call(
@@ -117,19 +134,16 @@ impl Function {
         namespaces: &mut Namespaces,
         heap: &mut Heap<impl ResourceTracker>,
         args: ArgValues,
+        defaults: &[Value],
         interns: &Interns,
         writer: &mut impl PrintWriter,
     ) -> RunResult<Value> {
-        // Build namespace sequentially: [params][cell_vars][free_vars][locals]
-        let mut namespace = Vec::with_capacity(self.namespace_size);
+        // 1. Bind arguments to parameters
+        let mut namespace = self
+            .signature
+            .bind(args, defaults, heap, interns, self.name, self.namespace_size)?;
 
-        // 1. Push arguments (slots 0..params.len())
-        args.inject_into_namespace(&mut namespace);
-        if namespace.len() != self.params.len() {
-            return self.wrong_arg_count_error(namespace.len(), interns);
-        }
-
-        // 2. Push cell_var refs (slots params.len()..params.len()+cell_var_count)
+        // 2. Push cell_var refs (slots param_count..param_count+cell_var_count)
         // These are cells for variables that nested functions capture from us
         for _ in 0..self.cell_var_count {
             let cell_id = heap.alloc_cell(Value::Undefined);
@@ -173,30 +187,29 @@ impl Function {
     /// * `heap` - The heap for allocating objects
     /// * `args` - The arguments to pass to the function
     /// * `captured_cells` - Cell HeapIds captured from the enclosing scope
+    /// * `defaults` - Evaluated default values for optional parameters
     /// * `interns` - String storage for looking up interned names in error messages
     /// * `writer` - The writer for print output
     ///
     /// This method is called when invoking a `Value::Closure`. The captured_cells
     /// are pushed sequentially after cell_vars in the namespace.
+    #[allow(clippy::too_many_arguments)]
     pub fn call_with_cells(
         &self,
         namespaces: &mut Namespaces,
         heap: &mut Heap<impl ResourceTracker>,
         args: ArgValues,
         captured_cells: &[HeapId],
+        defaults: &[Value],
         interns: &Interns,
         writer: &mut impl PrintWriter,
     ) -> RunResult<Value> {
-        // Build namespace sequentially: [params][cell_vars][free_vars][locals]
-        let mut namespace = Vec::with_capacity(self.namespace_size);
+        // 1. Bind arguments to parameters
+        let mut namespace = self
+            .signature
+            .bind(args, defaults, heap, interns, self.name, self.namespace_size)?;
 
-        // 1. Push arguments (slots 0..params.len())
-        args.inject_into_namespace(&mut namespace);
-        if namespace.len() != self.params.len() {
-            return self.wrong_arg_count_error(namespace.len(), interns);
-        }
-
-        // 2. Push cell_var refs (slots params.len()..params.len()+cell_var_count)
+        // 2. Push cell_var refs (slots param_count..param_count+cell_var_count)
         // A closure can also have cell_vars if it has nested functions
         for _ in 0..self.cell_var_count {
             let cell_id = heap.alloc_cell(Value::Undefined);
@@ -252,51 +265,6 @@ impl Function {
             interns.get_str(self.name.name_id),
             heap_id
         )
-    }
-
-    /// Creates an error for wrong number of arguments.
-    ///
-    /// Handles both "missing required positional arguments" and "too many arguments" cases,
-    /// formatting the error message to match CPython's style.
-    ///
-    /// # Arguments
-    /// * `actual_count` - Number of arguments actually provided
-    /// * `interns` - String storage for looking up interned names
-    fn wrong_arg_count_error(&self, actual_count: usize, interns: &Interns) -> RunResult<Value> {
-        let func_name = interns.get_str(self.name.name_id);
-        let msg = if let Some(missing_count) = self.params.len().checked_sub(actual_count) {
-            // Missing arguments - show actual parameter names
-            let mut msg = format!(
-                "{}() missing {} required positional argument{}: ",
-                func_name,
-                missing_count,
-                if missing_count == 1 { "" } else { "s" }
-            );
-            let mut missing_names: Vec<_> = self.params[actual_count..]
-                .iter()
-                .map(|string_id| format!("'{}'", interns.get_str(*string_id)))
-                .collect();
-            let last = missing_names.pop().unwrap();
-            if !missing_names.is_empty() {
-                msg.push_str(&missing_names.join(", "));
-                msg.push_str(", and ");
-            }
-            msg.push_str(&last);
-            msg
-        } else {
-            // Too many arguments
-            format!(
-                "{}() takes {} positional argument{} but {} {} given",
-                func_name,
-                self.params.len(),
-                if self.params.len() == 1 { "" } else { "s" },
-                actual_count,
-                if actual_count == 1 { "was" } else { "were" }
-            )
-        };
-        Err(SimpleException::new(ExcType::TypeError, Some(msg))
-            .with_position(self.name.position)
-            .into())
     }
 }
 
