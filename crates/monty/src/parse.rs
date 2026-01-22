@@ -456,14 +456,12 @@ impl<'a> Parser<'a> {
             }
             Stmt::Expr(ast::StmtExpr { value, .. }) => self.parse_expression(*value).map(Node::Expr),
             Stmt::Pass(_) => Ok(Node::Pass),
-            Stmt::Break(b) => Err(ParseError::not_implemented(
-                "break statements",
-                self.convert_range(b.range),
-            )),
-            Stmt::Continue(c) => Err(ParseError::not_implemented(
-                "continue statements",
-                self.convert_range(c.range),
-            )),
+            Stmt::Break(b) => Ok(Node::Break {
+                position: self.convert_range(b.range),
+            }),
+            Stmt::Continue(c) => Ok(Node::Continue {
+                position: self.convert_range(c.range),
+            }),
             Stmt::IpyEscapeCommand(i) => Err(ParseError::not_implemented(
                 "IPython escape commands",
                 self.convert_range(i.range),
@@ -1395,7 +1393,7 @@ impl ParseError {
             Self::Syntax { msg, position } => MontyException::new_full(
                 ExcType::SyntaxError,
                 Some(msg.into_owned()),
-                vec![StackFrame::from_position(position, filename, source)],
+                vec![StackFrame::from_position_syntax_error(position, filename, source)],
             ),
             Self::NotImplemented { msg, position } => MontyException::new_full(
                 ExcType::NotImplementedError,

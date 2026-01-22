@@ -80,26 +80,54 @@ pub struct Compiler<'a> {
     /// of immediately returning, we store the return value and jump to the
     /// finally block. The finally block will then execute the return.
     finally_targets: Vec<FinallyTarget>,
+
+    /// Tracks nesting depth inside exception handlers.
+    ///
+    /// When break/continue/return is inside an except handler, we need to
+    /// clear the current exception (`ClearException`) and pop the exception
+    /// value from the stack before jumping to the finally path or loop target.
+    except_handler_depth: usize,
 }
 
 /// Information about a loop for break/continue handling.
 ///
-/// Note: break/continue are not yet implemented in the parser,
-/// so this is currently unused but included for future use.
+/// Tracks the bytecode locations needed for compiling break and continue statements:
+/// - `start`: where continue should jump to (the ForIter instruction)
+/// - `break_jumps`: pending jumps from break statements that need to be patched
+///   to jump past the loop's else block
 struct LoopInfo {
     /// Bytecode offset of loop start (for continue).
-    _start: usize,
+    start: usize,
     /// Jump labels that need patching to loop end (for break).
     break_jumps: Vec<JumpLabel>,
 }
 
-/// Tracks a finally block for handling returns inside try-finally.
+/// A break or continue that needs to go through a finally block.
+///
+/// When break/continue is inside a try-finally, we need to run the finally block
+/// before executing the break/continue. This struct tracks the jump and which
+/// loop it targets.
+struct BreakContinueThruFinally {
+    /// The jump instruction that needs to be patched.
+    jump: JumpLabel,
+    /// The loop depth (index in loop_stack) being targeted.
+    target_loop_depth: usize,
+}
+
+/// Tracks a finally block for handling returns/break/continue inside try-finally.
 ///
 /// When compiling a try-finally, we push a `FinallyTarget` to track jumps
-/// from return statements that need to go through the finally block.
+/// from return/break/continue statements that need to go through the finally block.
 struct FinallyTarget {
     /// Jump labels for returns inside the try block that need to go to finally.
     return_jumps: Vec<JumpLabel>,
+    /// Break statements that need to go through this finally block.
+    break_jumps: Vec<BreakContinueThruFinally>,
+    /// Continue statements that need to go through this finally block.
+    continue_jumps: Vec<BreakContinueThruFinally>,
+    /// The loop depth when this finally was entered.
+    /// Used to determine if break/continue targets a loop outside this finally.
+    loop_depth_at_entry: usize,
 }
 
 /// Result of module compilation: the module code and all compiled functions.
@@ -120,6 +148,7 @@ impl<'a> Compiler<'a> {
             loop_stack: Vec::new(),
             cell_base: 0,
             finally_targets: Vec::new(),
+            except_handler_depth: 0,
         }
     }
 
@@ -132,6 +161,7 @@ impl<'a> Compiler<'a> {
             loop_stack: Vec::new(),
             cell_base,
             finally_targets: Vec::new(),
+            except_handler_depth: 0,
         }
     }
 
@@ -323,6 +353,14 @@ impl<'a> Compiler<'a> {
                 position,
             } => {
                 self.compile_import_from(*module_name, names, *position)?;
+            }
+
+            Node::Break { position } => {
+                self.compile_break(*position)?;
+            }
+
+            Node::Continue { position } => {
+                self.compile_continue(*position)?;
             }
 
             // These are handled during the prepare phase and produce no bytecode
@@ -1541,9 +1579,9 @@ impl<'a> Compiler<'a> {
         // Loop start
         let loop_start = self.code.current_offset();
 
-        // Push loop info for break/continue (future use)
+        // Push loop info for break/continue
         self.loop_stack.push(LoopInfo {
-            _start: loop_start,
+            start: loop_start,
             break_jumps: Vec::new(),
         });
 
@@ -1559,21 +1597,196 @@ impl<'a> Compiler<'a> {
         // Jump back to loop start
         self.code.emit_jump_to(Opcode::Jump, loop_start);
 
-        // End of loop
+        // End of loop - ForIter jumps here when iterator is exhausted
         self.code.patch_jump(end_jump);
 
-        // Pop loop info and patch break jumps (future use)
+        // Pop loop info before compiling else block
         let loop_info = self.loop_stack.pop().expect("loop stack underflow");
-        for break_jump in loop_info.break_jumps {
-            self.code.patch_jump(break_jump);
-        }
 
         // Compile else block (runs if loop completed without break)
         if !or_else.is_empty() {
             self.compile_block(or_else)?;
         }
 
+        // Patch break jumps to here - AFTER the else block so break skips else
+        for break_jump in loop_info.break_jumps {
+            self.code.patch_jump(break_jump);
+        }
+
         Ok(())
+    }
+
+    /// Compiles a break statement.
+    ///
+    /// Break exits the innermost loop and skips its else block. If inside a
+    /// try-finally, the finally block must run first.
+    ///
+    /// The bytecode without finally:
+    /// 1. Clean up exception state if inside except handler
+    /// 2. Pop the iterator (still on stack during loop body)
+    /// 3. Jump to after the else block
+    ///
+    /// With finally:
+    /// 1. Clean up exception state if inside except handler
+    /// 2. Pop the iterator
+    /// 3. Jump to "finally with break" path (patched when try compilation completes)
+    /// 4. That path runs finally, then jumps to after the else block
+    fn compile_break(&mut self, position: CodeRange) -> Result<(), CompileError> {
+        if self.loop_stack.is_empty() {
+            return Err(CompileError::new("'break' outside loop", position));
+        }
+
+        let target_loop_depth = self.loop_stack.len() - 1;
+
+        // If inside except handlers, clean up ALL exception states
+        // Each nested except handler has pushed an exception onto the stack,
+        // so we need to clear/pop each one when breaking out
+        for _ in 0..self.except_handler_depth {
+            self.code.emit(Opcode::ClearException);
+            self.code.emit(Opcode::Pop); // Pop the exception value
+        }
+
+        // Pop the iterator (on stack during loop body)
+        self.code.emit(Opcode::Pop);
+
+        // Check if we need to go through any finally blocks
+        // We need to run finally if break crosses the try boundary, i.e., if
+        // we're breaking from a loop that existed before the try started.
+        if let Some(finally_target) = self.finally_targets.last_mut()
+            && target_loop_depth < finally_target.loop_depth_at_entry
+        {
+            // Breaking from a loop that's outside (or at the start of) this try-finally,
+            // so finally must run before the break
+            let jump = self.code.emit_jump(Opcode::Jump);
+            finally_target.break_jumps.push(BreakContinueThruFinally {
+                jump,
+                target_loop_depth,
+            });
+            // Set stack depth for unreachable cleanup code (see comment below)
+            if self.except_handler_depth > 0 {
+                self.code
+                    .set_stack_depth(u16::try_from(self.except_handler_depth).unwrap_or(u16::MAX));
+            }
+            return Ok(());
+        }
+
+        // No finally to go through, jump directly to loop end
+        let jump = self.code.emit_jump(Opcode::Jump);
+        self.loop_stack[target_loop_depth].break_jumps.push(jump);
+
+        // The code following this break is unreachable at runtime, but the compiler
+        // will still emit cleanup code for each enclosing except handler (ClearException + Pop).
+        // Set stack depth so those unreachable pops don't cause negative stack tracking.
+        if self.except_handler_depth > 0 {
+            self.code
+                .set_stack_depth(u16::try_from(self.except_handler_depth).unwrap_or(u16::MAX));
+        }
+
+        Ok(())
+    }
+
+    /// Compiles a continue statement.
+    ///
+    /// Continue jumps back to the loop start (the ForIter instruction) which
+    /// advances the iterator and either enters the next iteration or exits the loop.
+    /// If inside a try-finally, the finally block must run first.
+    fn compile_continue(&mut self, position: CodeRange) -> Result<(), CompileError> {
+        if self.loop_stack.is_empty() {
+            return Err(CompileError::new("'continue' not properly in loop", position));
+        }
+
+        let target_loop_depth = self.loop_stack.len() - 1;
+
+        // If inside except handlers, clean up ALL exception states
+        // Each nested except handler has pushed an exception onto the stack,
+        // so we need to clear/pop each one when continuing
+        for _ in 0..self.except_handler_depth {
+            self.code.emit(Opcode::ClearException);
+            self.code.emit(Opcode::Pop); // Pop the exception value
+        }
+
+        // Check if we need to go through any finally blocks
+        // We need to run finally if continue crosses the try boundary
+        if let Some(finally_target) = self.finally_targets.last_mut()
+            && target_loop_depth < finally_target.loop_depth_at_entry
+        {
+            // Continuing a loop that's outside (or at the start of) this try-finally,
+            // so finally must run before the continue
+            let jump = self.code.emit_jump(Opcode::Jump);
+            finally_target.continue_jumps.push(BreakContinueThruFinally {
+                jump,
+                target_loop_depth,
+            });
+            // Set stack depth for unreachable cleanup code (see comment below)
+            if self.except_handler_depth > 0 {
+                self.code
+                    .set_stack_depth(u16::try_from(self.except_handler_depth).unwrap_or(u16::MAX));
+            }
+            return Ok(());
+        }
+
+        // No finally to go through, jump directly to loop start
+        let loop_start = self.loop_stack[target_loop_depth].start;
+        self.code.emit_jump_to(Opcode::Jump, loop_start);
+
+        // The code following this continue is unreachable at runtime, but the compiler
+        // will still emit cleanup code for each enclosing except handler (ClearException + Pop).
+        // Set stack depth so those unreachable pops don't cause negative stack tracking.
+        if self.except_handler_depth > 0 {
+            self.code
+                .set_stack_depth(u16::try_from(self.except_handler_depth).unwrap_or(u16::MAX));
+        }
+
+        Ok(())
+    }
+
+    /// Compiles break or continue after a finally block has run.
+    ///
+    /// Called from `compile_try` after the finally block code. Each control flow
+    /// statement may target a different loop, so we check if there's another finally
+    /// to go through or if we can jump directly to the loop's target.
+    ///
+    /// Note: All items in the list jumped to the same finally block, so they all
+    /// have the same starting point. After finally runs, we need to route each
+    /// to its target loop, potentially through more finally blocks.
+    fn compile_control_flow_after_finally(&mut self, items: &[BreakContinueThruFinally], is_break: bool) {
+        // All items went through the same finally, now we need to dispatch to
+        // potentially different loops. For simplicity, we assume all items in
+        // a single finally target the same loop (the innermost one at the time).
+        // This is always true since break/continue only targets the innermost loop.
+        let Some(first) = items.first() else {
+            return;
+        };
+        let target_loop_depth = first.target_loop_depth;
+
+        // Check if there's another finally between us and the target loop
+        if let Some(finally_target) = self.finally_targets.last_mut()
+            && target_loop_depth < finally_target.loop_depth_at_entry
+        {
+            // Need to go through another finally
+            let jump = self.code.emit_jump(Opcode::Jump);
+            let jump_info = BreakContinueThruFinally {
+                jump,
+                target_loop_depth,
+            };
+            if is_break {
+                finally_target.break_jumps.push(jump_info);
+            } else {
+                // else continue
+                finally_target.continue_jumps.push(jump_info);
+            }
+            return;
+        }
+
+        // No more finally blocks, jump directly to the loop target
+        if is_break {
+            let jump = self.code.emit_jump(Opcode::Jump);
+            self.loop_stack[target_loop_depth].break_jumps.push(jump);
+        } else {
+            // else continue
+            let loop_start = self.loop_stack[target_loop_depth].start;
+            self.code.emit_jump_to(Opcode::Jump, loop_start);
+        }
     }
 
     // ========================================================================
@@ -1915,6 +2128,12 @@ impl<'a> Compiler<'a> {
     ///
     /// Returns inside try/except/else jump to a "finally with return" path that
     /// runs the finally code then returns the value.
+    ///
+    /// **Note:** The finally block code is emitted multiple times (once for each
+    /// control flow path: normal, exception, return, break, continue). This is the
+    /// same approach CPython uses - each path has different stack state at entry
+    /// (e.g., return has a value on stack, break has popped the iterator), so we
+    /// can't easily share a single copy. The duplication is intentional.
     fn compile_try(&mut self, try_block: &Try<PreparedNode>) -> Result<(), CompileError> {
         let has_finally = !try_block.finally.is_empty();
         let has_handlers = !try_block.handlers.is_empty();
@@ -1923,10 +2142,13 @@ impl<'a> Compiler<'a> {
         // Record stack depth at try entry (for unwinding on exception)
         let stack_depth = self.code.stack_depth();
 
-        // If there's a finally block, track returns inside try/handlers/else
+        // If there's a finally block, track returns/break/continue inside try/handlers/else
         if has_finally {
             self.finally_targets.push(FinallyTarget {
                 return_jumps: Vec::new(),
+                break_jumps: Vec::new(),
+                continue_jumps: Vec::new(),
+                loop_depth_at_entry: self.loop_stack.len(),
             });
         }
 
@@ -1941,16 +2163,28 @@ impl<'a> Compiler<'a> {
         // === Handler dispatch starts here ===
         let handler_start = self.code.current_offset();
 
+        // VM pushes exception onto stack when entering handler.
+        // Adjust compiler's stack depth tracking to reflect this.
+        self.code.adjust_stack_depth(1);
+
         // Track jumps that go to finally (for patching later)
         let mut finally_jumps: Vec<JumpLabel> = Vec::new();
 
         if has_handlers {
             // Compile exception handlers
-            self.compile_exception_handlers(&try_block.handlers, &mut finally_jumps)?;
+            // handler_entry_depth = stack_depth + 1 (exception on stack)
+            let handler_entry_depth = stack_depth + 1;
+            self.compile_exception_handlers(&try_block.handlers, &mut finally_jumps, handler_entry_depth)?;
         } else {
             // No handlers - just reraise (this only happens with try-finally)
             self.code.emit(Opcode::Reraise);
         }
+
+        // After handler dispatch, each handler path either:
+        // 1. Matched and popped the exception (via Pop), then jumped to finally
+        // 2. Didn't match and reraised (for last handler)
+        // The handlers' Pop instructions already account for the exception,
+        // so no additional stack depth adjustment is needed here.
 
         // Mark end of handler dispatch (for finally exception entry)
         let handler_dispatch_end = self.code.current_offset();
@@ -1960,7 +2194,8 @@ impl<'a> Compiler<'a> {
         // and ensures finally runs before the exception propagates.
         let finally_cleanup_start = if has_finally {
             let cleanup_start = self.code.current_offset();
-            // Exception value is on stack (pushed by VM)
+            // Exception value is on stack (pushed by VM), so stack = stack_depth + 1
+            self.code.set_stack_depth(stack_depth + 1);
             // We need to pop it, run finally, then reraise
             // But we can't easily save the exception, so we use a different approach:
             // The exception is already on the exception_stack from handle_exception,
@@ -1973,32 +2208,63 @@ impl<'a> Compiler<'a> {
             None
         };
 
-        // === Finally with return path ===
-        // Returns from try/handler/else come here (return value is on stack)
-        // Pop finally target and get the return jumps
+        // === Finally with return/break/continue paths ===
+        // Pop finally target and get all the jumps that need to go through finally
         let finally_with_return_start = if has_finally {
             let finally_target = self.finally_targets.pop().expect("finally_targets should not be empty");
-            if finally_target.return_jumps.is_empty() {
+
+            // === Finally with return path ===
+            let return_start = if finally_target.return_jumps.is_empty() {
                 None
             } else {
                 let start = self.code.current_offset();
-                // Patch all return jumps to come here
                 for jump in finally_target.return_jumps {
                     self.code.patch_jump(jump);
                 }
-                // Return value is on stack, run finally, then return (or continue to outer finally)
+                // Return value is on stack, stack = stack_depth + 1
+                self.code.set_stack_depth(stack_depth + 1);
                 self.compile_block(&try_block.finally)?;
-                // Use compile_return() to handle nested try-finally correctly
-                // If there's an outer finally, this jumps there; otherwise it returns
                 self.compile_return();
                 Some(start)
+            };
+
+            // === Finally with break path ===
+            // For each break, run finally then either:
+            // - Jump to outer finally's break path (if there's an outer finally between us and the loop)
+            // - Jump directly to the loop's break target
+            if !finally_target.break_jumps.is_empty() {
+                for break_info in &finally_target.break_jumps {
+                    self.code.patch_jump(break_info.jump);
+                }
+                // Break already popped the iterator, so stack = stack_depth - 1
+                // (the iterator was on stack at try entry, break removed it)
+                self.code.set_stack_depth(stack_depth.saturating_sub(1));
+                self.compile_block(&try_block.finally)?;
+                // After finally, compile the break again (handles nested finally or direct jump)
+                self.compile_control_flow_after_finally(&finally_target.break_jumps, true);
             }
+
+            // === Finally with continue path ===
+            if !finally_target.continue_jumps.is_empty() {
+                for continue_info in &finally_target.continue_jumps {
+                    self.code.patch_jump(continue_info.jump);
+                }
+                // Continue doesn't pop the iterator, stack = stack_depth
+                self.code.set_stack_depth(stack_depth);
+                self.compile_block(&try_block.finally)?;
+                // After finally, compile the continue again (handles nested finally or direct jump)
+                self.compile_control_flow_after_finally(&finally_target.continue_jumps, false);
+            }
+
+            return_start
         } else {
             None
         };
 
         // === Else block (runs if no exception) ===
         self.code.patch_jump(after_try_jump);
+        // Normal path from try body, stack = stack_depth
+        self.code.set_stack_depth(stack_depth);
         let else_start = self.code.current_offset();
         if has_else {
             self.compile_block(&try_block.or_else)?;
@@ -2012,6 +2278,8 @@ impl<'a> Compiler<'a> {
         }
 
         if has_finally {
+            // Stack = stack_depth (no exception, no return value)
+            self.code.set_stack_depth(stack_depth);
             self.compile_block(&try_block.finally)?;
         }
 
@@ -2068,10 +2336,14 @@ impl<'a> Compiler<'a> {
     ///
     /// Each handler checks if the exception matches its type, and if so,
     /// executes the handler body. If no handler matches, the exception is re-raised.
+    ///
+    /// `handler_entry_depth` is the stack depth when entering handler dispatch
+    /// (i.e., base stack_depth + 1 for the exception value).
     fn compile_exception_handlers(
         &mut self,
         handlers: &[ExceptHandler<PreparedNode>],
         finally_jumps: &mut Vec<JumpLabel>,
+        handler_entry_depth: u16,
     ) -> Result<(), CompileError> {
         // Track jumps from non-matching handlers to next handler
         let mut next_handler_jumps: Vec<JumpLabel> = Vec::new();
@@ -2080,8 +2352,16 @@ impl<'a> Compiler<'a> {
             let is_last = i == handlers.len() - 1;
 
             // Patch jumps from previous handler's non-match to here
-            for jump in next_handler_jumps.drain(..) {
-                self.code.patch_jump(jump);
+            // If jumping from a previous handler's no-match, stack has [exc, exc] (duplicate)
+            // We need to pop the duplicate before starting this handler's check
+            if !next_handler_jumps.is_empty() {
+                for jump in next_handler_jumps.drain(..) {
+                    self.code.patch_jump(jump);
+                }
+                // Reset stack depth for jump target: [exc, exc] = handler_entry_depth + 1
+                self.code.set_stack_depth(handler_entry_depth + 1);
+                // Pop the duplicate from previous handler's check
+                self.code.emit(Opcode::Pop);
             }
 
             if let Some(exc_type) = &handler.exc_type {
@@ -2098,10 +2378,12 @@ impl<'a> Compiler<'a> {
 
                 // Check if exception matches the type
                 // This validates exc_type is a valid exception type and performs the match
+                // CheckExcMatch pops exc_type, peeks exception, pushes bool
                 self.code.emit(Opcode::CheckExcMatch);
-                // Stack: [exception, bool]
+                // Stack: [exception, exception, bool]
 
                 // Jump to next handler if match returned False
+                // JumpIfFalse pops the bool, leaving [exception, exception]
                 let no_match_jump = self.code.emit_jump(Opcode::JumpIfFalse);
 
                 if is_last {
@@ -2111,6 +2393,11 @@ impl<'a> Compiler<'a> {
                     next_handler_jumps.push(no_match_jump);
                 }
 
+                // After JumpIfFalse (match succeeded), stack is [exception, exception]
+                // Pop the duplicate that was used for the type check
+                self.code.emit(Opcode::Pop);
+                // Stack: [exception]
+
                 // Exception matched! Bind to variable if needed
                 if let Some(name) = &handler.name {
                     // Stack: [exception]
@@ -2119,8 +2406,14 @@ impl<'a> Compiler<'a> {
                     self.compile_store(name);
                 }
 
+                // Track that we're inside an except handler (for break/continue cleanup)
+                self.except_handler_depth += 1;
+
                 // Compile handler body
                 self.compile_block(&handler.body)?;
+
+                // Exit except handler context
+                self.except_handler_depth -= 1;
 
                 // Delete exception variable (Python 3 behavior)
                 if let Some(name) = &handler.name {
@@ -2139,6 +2432,11 @@ impl<'a> Compiler<'a> {
                 // If this was last handler and no match, we need to reraise
                 if is_last {
                     self.code.patch_jump(no_match_jump);
+                    // Coming from JumpIfFalse no-match path, stack has [exception, exception]
+                    // Reset stack depth for jump target
+                    self.code.set_stack_depth(handler_entry_depth + 1);
+                    // We need to pop the duplicate before reraising
+                    self.code.emit(Opcode::Pop);
                     self.code.emit(Opcode::Reraise);
                 }
             } else {
@@ -2151,8 +2449,14 @@ impl<'a> Compiler<'a> {
                     self.compile_store(name);
                 }
 
+                // Track that we're inside an except handler (for break/continue cleanup)
+                self.except_handler_depth += 1;
+
                 // Compile handler body
                 self.compile_block(&handler.body)?;
+
+                // Exit except handler context
+                self.except_handler_depth -= 1;
 
                 // Delete exception variable
                 if let Some(name) = &handler.name {
@@ -2236,9 +2540,15 @@ impl CompileError {
     /// Converts this compile error into a Python exception.
     ///
     /// Uses the stored exception type (SyntaxError or ModuleNotFoundError).
-    /// Module errors have `hide_caret: true` since CPython doesn't show carets for these.
+    /// - SyntaxError: hides the `, in <module>` part (CPython's format)
+    /// - ModuleNotFoundError: hides caret markers (CPython doesn't show them)
     pub fn into_python_exc(self, filename: &str, source: &str) -> MontyException {
-        let mut frame = StackFrame::from_position(self.position, filename, source);
+        let mut frame = if self.exc_type == ExcType::SyntaxError {
+            // SyntaxError uses different format: no `, in <module>`
+            StackFrame::from_position_syntax_error(self.position, filename, source)
+        } else {
+            StackFrame::from_position(self.position, filename, source)
+        };
         // CPython doesn't show carets for module not found errors
         if self.exc_type == ExcType::ModuleNotFoundError {
             frame.hide_caret = true;
