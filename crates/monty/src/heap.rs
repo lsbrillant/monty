@@ -3,7 +3,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
-    mem::{ManuallyDrop, discriminant},
+    mem::{ManuallyDrop, discriminant, size_of},
     ptr::addr_of,
     vec,
 };
@@ -17,7 +17,7 @@ use crate::{
     asyncio::{Coroutine, GatherFuture, GatherItem},
     exception_private::{ExcType, RunResult, SimpleException},
     intern::{FunctionId, Interns, StringId},
-    resource::{ResourceError, ResourceTracker},
+    resource::{DepthGuard, ResourceError, ResourceTracker, check_mult_size, check_repeat_size},
     types::{
         AttrCallResult, Bytes, Dataclass, Dict, FrozenSet, List, LongInt, Module, MontyIter, NamedTuple, Path, PyTrait,
         Range, Set, Slice, Str, Tuple, Type, allocate_tuple,
@@ -248,7 +248,7 @@ impl HeapData {
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
                 // Tuple is hashable only if all elements are hashable
-                for obj in t.as_vec() {
+                for obj in t.as_slice() {
                     let h = obj.py_hash(heap, interns)?;
                     h.hash(&mut hasher);
                 }
@@ -406,46 +406,59 @@ impl PyTrait for HeapData {
         }
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        guard: &mut DepthGuard,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         match (self, other) {
-            (Self::Str(a), Self::Str(b)) => a.py_eq(b, heap, interns),
-            (Self::Bytes(a), Self::Bytes(b)) => a.py_eq(b, heap, interns),
-            (Self::List(a), Self::List(b)) => a.py_eq(b, heap, interns),
-            (Self::Tuple(a), Self::Tuple(b)) => a.py_eq(b, heap, interns),
-            (Self::NamedTuple(a), Self::NamedTuple(b)) => a.py_eq(b, heap, interns),
+            (Self::Str(a), Self::Str(b)) => a.py_eq(b, heap, guard, interns),
+            (Self::Bytes(a), Self::Bytes(b)) => a.py_eq(b, heap, guard, interns),
+            (Self::List(a), Self::List(b)) => a.py_eq(b, heap, guard, interns),
+            (Self::Tuple(a), Self::Tuple(b)) => a.py_eq(b, heap, guard, interns),
+            (Self::NamedTuple(a), Self::NamedTuple(b)) => a.py_eq(b, heap, guard, interns),
             // NamedTuple can compare with Tuple by elements (matching CPython behavior)
             (Self::NamedTuple(nt), Self::Tuple(t)) | (Self::Tuple(t), Self::NamedTuple(nt)) => {
                 let nt_items = nt.as_vec();
-                let t_items = t.as_vec();
+                let t_items = t.as_slice();
                 if nt_items.len() != t_items.len() {
-                    return false;
+                    return Ok(false);
                 }
-                nt_items
-                    .iter()
-                    .zip(t_items.iter())
-                    .all(|(a, b)| a.py_eq(b, heap, interns))
+                guard.increase_err()?;
+                for (a, b) in nt_items.iter().zip(t_items.iter()) {
+                    if !a.py_eq(b, heap, guard, interns)? {
+                        guard.decrease();
+                        return Ok(false);
+                    }
+                }
+                guard.decrease();
+                Ok(true)
             }
-            (Self::Dict(a), Self::Dict(b)) => a.py_eq(b, heap, interns),
-            (Self::Set(a), Self::Set(b)) => a.py_eq(b, heap, interns),
-            (Self::FrozenSet(a), Self::FrozenSet(b)) => a.py_eq(b, heap, interns),
-            (Self::Closure(a_id, a_cells, _), Self::Closure(b_id, b_cells, _)) => *a_id == *b_id && a_cells == b_cells,
-            (Self::FunctionDefaults(a_id, _), Self::FunctionDefaults(b_id, _)) => *a_id == *b_id,
-            (Self::Range(a), Self::Range(b)) => a.py_eq(b, heap, interns),
-            (Self::Dataclass(a), Self::Dataclass(b)) => a.py_eq(b, heap, interns),
+            (Self::Dict(a), Self::Dict(b)) => a.py_eq(b, heap, guard, interns),
+            (Self::Set(a), Self::Set(b)) => a.py_eq(b, heap, guard, interns),
+            (Self::FrozenSet(a), Self::FrozenSet(b)) => a.py_eq(b, heap, guard, interns),
+            (Self::Closure(a_id, a_cells, _), Self::Closure(b_id, b_cells, _)) => {
+                Ok(*a_id == *b_id && a_cells == b_cells)
+            }
+            (Self::FunctionDefaults(a_id, _), Self::FunctionDefaults(b_id, _)) => Ok(*a_id == *b_id),
+            (Self::Range(a), Self::Range(b)) => a.py_eq(b, heap, guard, interns),
+            (Self::Dataclass(a), Self::Dataclass(b)) => a.py_eq(b, heap, guard, interns),
             // LongInt equality
-            (Self::LongInt(a), Self::LongInt(b)) => a == b,
+            (Self::LongInt(a), Self::LongInt(b)) => Ok(a == b),
             // Slice equality
-            (Self::Slice(a), Self::Slice(b)) => a.py_eq(b, heap, interns),
+            (Self::Slice(a), Self::Slice(b)) => a.py_eq(b, heap, guard, interns),
             // Path equality
-            (Self::Path(a), Self::Path(b)) => a.py_eq(b, heap, interns),
+            (Self::Path(a), Self::Path(b)) => a.py_eq(b, heap, guard, interns),
             // Cells, Exceptions, Iterators, Modules, and async types compare by identity only (handled at Value level via HeapId comparison)
             (Self::Cell(_), Self::Cell(_))
             | (Self::Exception(_), Self::Exception(_))
             | (Self::Iter(_), Self::Iter(_))
             | (Self::Module(_), Self::Module(_))
             | (Self::Coroutine(_), Self::Coroutine(_))
-            | (Self::GatherFuture(_), Self::GatherFuture(_)) => false,
-            _ => false, // Different types are never equal
+            | (Self::GatherFuture(_), Self::GatherFuture(_)) => Ok(false),
+            _ => Ok(false), // Different types are never equal
         }
     }
 
@@ -532,26 +545,27 @@ impl PyTrait for HeapData {
         f: &mut impl Write,
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
+        guard: &mut DepthGuard,
         interns: &Interns,
     ) -> std::fmt::Result {
         match self {
-            Self::Str(s) => s.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::Bytes(b) => b.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::List(l) => l.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::Tuple(t) => t.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::NamedTuple(nt) => nt.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::Dict(d) => d.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::Set(s) => s.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::FrozenSet(fs) => fs.py_repr_fmt(f, heap, heap_ids, interns),
+            Self::Str(s) => s.py_repr_fmt(f, heap, heap_ids, guard, interns),
+            Self::Bytes(b) => b.py_repr_fmt(f, heap, heap_ids, guard, interns),
+            Self::List(l) => l.py_repr_fmt(f, heap, heap_ids, guard, interns),
+            Self::Tuple(t) => t.py_repr_fmt(f, heap, heap_ids, guard, interns),
+            Self::NamedTuple(nt) => nt.py_repr_fmt(f, heap, heap_ids, guard, interns),
+            Self::Dict(d) => d.py_repr_fmt(f, heap, heap_ids, guard, interns),
+            Self::Set(s) => s.py_repr_fmt(f, heap, heap_ids, guard, interns),
+            Self::FrozenSet(fs) => fs.py_repr_fmt(f, heap, heap_ids, guard, interns),
             Self::Closure(f_id, _, _) | Self::FunctionDefaults(f_id, _) => {
                 interns.get_function(*f_id).py_repr_fmt(f, interns, 0)
             }
             // Cell repr shows the contained value's type
             Self::Cell(v) => write!(f, "<cell: {} object>", v.py_type(heap)),
-            Self::Range(r) => r.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::Slice(s) => s.py_repr_fmt(f, heap, heap_ids, interns),
+            Self::Range(r) => r.py_repr_fmt(f, heap, heap_ids, guard, interns),
+            Self::Slice(s) => s.py_repr_fmt(f, heap, heap_ids, guard, interns),
             Self::Exception(e) => e.py_repr_fmt(f),
-            Self::Dataclass(dc) => dc.py_repr_fmt(f, heap, heap_ids, interns),
+            Self::Dataclass(dc) => dc.py_repr_fmt(f, heap, heap_ids, guard, interns),
             Self::Iter(_) => write!(f, "<iterator>"),
             Self::LongInt(li) => write!(f, "{li}"),
             Self::Module(m) => write!(f, "<module '{}'>", interns.get_str(m.name())),
@@ -561,14 +575,19 @@ impl PyTrait for HeapData {
                 write!(f, "<coroutine object {name}>")
             }
             Self::GatherFuture(gather) => write!(f, "<gather({})>", gather.item_count()),
-            Self::Path(p) => p.py_repr_fmt(f, heap, heap_ids, interns),
+            Self::Path(p) => p.py_repr_fmt(f, heap, heap_ids, guard, interns),
         }
     }
 
-    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Cow<'static, str> {
+    fn py_str(
+        &self,
+        heap: &Heap<impl ResourceTracker>,
+        guard: &mut DepthGuard,
+        interns: &Interns,
+    ) -> Cow<'static, str> {
         match self {
             // Strings return their value directly without quotes
-            Self::Str(s) => s.py_str(heap, interns),
+            Self::Str(s) => s.py_str(heap, guard, interns),
             // LongInt returns its string representation
             Self::LongInt(li) => Cow::Owned(li.to_string()),
             // Exceptions return just the message (or empty string if no message)
@@ -576,7 +595,7 @@ impl PyTrait for HeapData {
             // Paths return the path string without the PosixPath() wrapper
             Self::Path(p) => Cow::Owned(p.as_str().to_owned()),
             // All other types use repr
-            _ => self.py_repr(heap, interns),
+            _ => self.py_repr(heap, guard, interns),
         }
     }
 
@@ -1335,7 +1354,7 @@ impl<T: ResourceTracker> Heap<T> {
 
         if let HeapData::List(list) = &source_data {
             // Copy items and track which refs need incrementing
-            let items: Vec<Value> = list.as_vec().iter().map(Value::copy_for_extend).collect();
+            let items: Vec<Value> = list.as_slice().iter().map(Value::copy_for_extend).collect();
             let ref_ids: Vec<HeapId> = items.iter().filter_map(Value::ref_id).collect();
 
             // Restore source data before mutating heap (inc_ref needs it)
@@ -1353,6 +1372,73 @@ impl<T: ResourceTracker> Heap<T> {
             // Not a list, restore and return false
             restore_data!(self, source_id, source_data, "iadd_extend_list");
             false
+        }
+    }
+
+    /// Multiplies a heap-allocated value by an `i64`.
+    ///
+    /// If `id` refers to a `LongInt`, performs integer multiplication with a size
+    /// pre-check. Otherwise, treats `id` as a sequence and `int_val` as the repeat
+    /// count. This avoids multiple `heap.get()` calls by looking up the data once.
+    ///
+    /// Returns `Ok(None)` if the heap entry is neither a LongInt nor a sequence type.
+    pub fn mult_ref_by_i64(&mut self, id: HeapId, int_val: i64) -> RunResult<Option<Value>> {
+        let data = take_data!(self, id, "mult_ref_by_i64");
+
+        if let HeapData::LongInt(li) = &data {
+            check_mult_size(li.bits(), i64_bits(int_val), &self.tracker)?;
+            let result = LongInt::new(li.inner().clone()) * LongInt::from(int_val);
+            restore_data!(self, id, data, "mult_ref_by_i64");
+            Ok(Some(result.into_value(self)?))
+        } else {
+            restore_data!(self, id, data, "mult_ref_by_i64");
+            let count = i64_to_repeat_count(int_val)?;
+            self.mult_sequence(id, count)
+        }
+    }
+
+    /// Multiplies two heap-allocated values.
+    ///
+    /// Uses `with_two` to take both entries out once, then matches on the pair:
+    /// - `LongInt * LongInt`: integer multiplication with size pre-check
+    /// - `LongInt * sequence` or `sequence * LongInt`: sequence repetition
+    /// - Anything else: returns `Ok(None)` for unsupported type combinations
+    pub fn mult_heap_values(&mut self, id1: HeapId, id2: HeapId) -> RunResult<Option<Value>> {
+        // Extract the information we need from a single lookup of both values
+        enum MultKind {
+            LongInts { a_bits: u64, b_bits: u64 },
+            SeqTimesLong { seq_id: HeapId, count: usize },
+            Unsupported,
+        }
+
+        let kind = self.with_two(id1, id2, |_heap, left, right| match (left, right) {
+            (HeapData::LongInt(a), HeapData::LongInt(b)) => Ok(MultKind::LongInts {
+                a_bits: a.bits(),
+                b_bits: b.bits(),
+            }),
+            (_, HeapData::LongInt(li)) => {
+                longint_to_repeat_count(li).map(|c| MultKind::SeqTimesLong { seq_id: id1, count: c })
+            }
+            (HeapData::LongInt(li), _) => {
+                longint_to_repeat_count(li).map(|c| MultKind::SeqTimesLong { seq_id: id2, count: c })
+            }
+            _ => Ok(MultKind::Unsupported),
+        })?;
+
+        match kind {
+            MultKind::LongInts { a_bits, b_bits } => {
+                check_mult_size(a_bits, b_bits, &self.tracker)?;
+                Ok(self.with_two(id1, id2, |heap, left, right| {
+                    if let (HeapData::LongInt(a), HeapData::LongInt(b)) = (left, right) {
+                        let result = LongInt::new(a.inner() * b.inner());
+                        result.into_value(heap).map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })?)
+            }
+            MultKind::SeqTimesLong { seq_id, count } => self.mult_sequence(seq_id, count),
+            MultKind::Unsupported => Ok(None),
         }
     }
 
@@ -1376,11 +1462,13 @@ impl<T: ResourceTracker> Heap<T> {
 
         match &data {
             HeapData::Str(s) => {
+                check_repeat_size(s.len(), count, &self.tracker)?;
                 let repeated = s.as_str().repeat(count);
                 restore_data!(self, id, data, "mult_sequence");
                 Ok(Some(Value::Ref(self.allocate(HeapData::Str(repeated.into()))?)))
             }
             HeapData::Bytes(b) => {
+                check_repeat_size(b.len(), count, &self.tracker)?;
                 let repeated = b.as_slice().repeat(count);
                 restore_data!(self, id, data, "mult_sequence");
                 Ok(Some(Value::Ref(self.allocate(HeapData::Bytes(repeated.into()))?)))
@@ -1390,8 +1478,11 @@ impl<T: ResourceTracker> Heap<T> {
                     restore_data!(self, id, data, "mult_sequence");
                     Ok(Some(Value::Ref(self.allocate(HeapData::List(List::new(Vec::new())))?)))
                 } else {
+                    // Pre-check memory limit for large results
+                    check_repeat_size(list.len().saturating_mul(size_of::<Value>()), count, &self.tracker)?;
+
                     // Copy items and track which refs need incrementing
-                    let items: Vec<Value> = list.as_vec().iter().map(Value::copy_for_extend).collect();
+                    let items: Vec<Value> = list.as_slice().iter().map(Value::copy_for_extend).collect();
                     let ref_ids: Vec<HeapId> = items.iter().filter_map(Value::ref_id).collect();
                     let original_len = items.len();
 
@@ -1430,8 +1521,15 @@ impl<T: ResourceTracker> Heap<T> {
                     // Use empty tuple singleton
                     Ok(Some(self.get_empty_tuple()))
                 } else {
+                    // Pre-check memory limit for large results
+                    check_repeat_size(
+                        tuple.as_slice().len().saturating_mul(size_of::<Value>()),
+                        count,
+                        &self.tracker,
+                    )?;
+
                     // Copy items and track which refs need incrementing
-                    let items: Vec<Value> = tuple.as_vec().iter().map(Value::copy_for_extend).collect();
+                    let items: Vec<Value> = tuple.as_slice().iter().map(Value::copy_for_extend).collect();
                     let ref_ids: Vec<HeapId> = items.iter().filter_map(Value::ref_id).collect();
                     let original_len = items.len();
 
@@ -1546,6 +1644,44 @@ impl<T: ResourceTracker> Heap<T> {
     }
 }
 
+/// Computes the number of significant bits in an `i64`.
+///
+/// Returns 0 for zero, otherwise returns the position of the highest set bit
+/// plus one. Uses unsigned absolute value to handle negative numbers correctly.
+fn i64_bits(value: i64) -> u64 {
+    if value == 0 {
+        0
+    } else {
+        u64::from(64 - value.unsigned_abs().leading_zeros())
+    }
+}
+
+/// Converts an `i64` repeat count to `usize` for sequence repetition.
+///
+/// Returns 0 for negative values (Python treats negative repeat counts as 0).
+/// Returns `OverflowError` if the value exceeds `usize::MAX`.
+fn i64_to_repeat_count(n: i64) -> RunResult<usize> {
+    if n <= 0 {
+        Ok(0)
+    } else {
+        usize::try_from(n).map_err(|_| ExcType::overflow_repeat_count().into())
+    }
+}
+
+/// Converts a `LongInt` repeat count to `usize` for sequence repetition.
+///
+/// Returns 0 for negative values (Python treats negative repeat counts as 0).
+/// Returns `OverflowError` if the value exceeds `usize::MAX`.
+fn longint_to_repeat_count(li: &LongInt) -> RunResult<usize> {
+    if li.is_negative() {
+        Ok(0)
+    } else if let Some(count) = li.to_usize() {
+        Ok(count)
+    } else {
+        Err(ExcType::overflow_repeat_count().into())
+    }
+}
+
 /// Collects child HeapIds from a HeapData value for GC traversal.
 fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
     match data {
@@ -1562,7 +1698,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             if !list.contains_refs() {
                 return;
             }
-            for value in list.as_vec() {
+            for value in list.as_slice() {
                 if let Value::Ref(id) = value {
                     work_list.push(*id);
                 }
@@ -1573,7 +1709,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             if !tuple.contains_refs() {
                 return;
             }
-            for value in tuple.as_vec() {
+            for value in tuple.as_slice() {
                 if let Value::Ref(id) = value {
                     work_list.push(*id);
                 }
@@ -1778,6 +1914,14 @@ impl<T: ResourceTracker> DropWithHeap<T> for Vec<Value> {
 }
 
 impl<T: ResourceTracker> DropWithHeap<T> for vec::IntoIter<Value> {
+    fn drop_with_heap(self, heap: &mut Heap<T>) {
+        for value in self {
+            value.drop_with_heap(heap);
+        }
+    }
+}
+
+impl<T: ResourceTracker, const N: usize> DropWithHeap<T> for [Value; N] {
     fn drop_with_heap(self, heap: &mut Heap<T>) {
         for value in self {
             value.drop_with_heap(heap);

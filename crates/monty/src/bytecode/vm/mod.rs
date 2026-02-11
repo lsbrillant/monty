@@ -811,14 +811,14 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
                 Opcode::BinaryRShift => {
                     try_catch_sync!(self, cached_frame, self.binary_bitwise(BitwiseOp::RShift));
                 }
-                Opcode::BinaryMatMul => todo!("BinaryMatMul not implemented"),
+                Opcode::BinaryMatMul => try_catch_sync!(self, cached_frame, self.binary_matmul()),
                 // Comparison Operations
-                Opcode::CompareEq => self.compare_eq(),
-                Opcode::CompareNe => self.compare_ne(),
-                Opcode::CompareLt => self.compare_ord(Ordering::is_lt),
-                Opcode::CompareLe => self.compare_ord(Ordering::is_le),
-                Opcode::CompareGt => self.compare_ord(Ordering::is_gt),
-                Opcode::CompareGe => self.compare_ord(Ordering::is_ge),
+                Opcode::CompareEq => try_catch_sync!(self, cached_frame, self.compare_eq()),
+                Opcode::CompareNe => try_catch_sync!(self, cached_frame, self.compare_ne()),
+                Opcode::CompareLt => try_catch_sync!(self, cached_frame, self.compare_ord(Ordering::is_lt)),
+                Opcode::CompareLe => try_catch_sync!(self, cached_frame, self.compare_ord(Ordering::is_le)),
+                Opcode::CompareGt => try_catch_sync!(self, cached_frame, self.compare_ord(Ordering::is_gt)),
+                Opcode::CompareGe => try_catch_sync!(self, cached_frame, self.compare_ord(Ordering::is_ge)),
                 Opcode::CompareIs => self.compare_is(false),
                 Opcode::CompareIsNot => self.compare_is(true),
                 Opcode::CompareIn => try_catch_sync!(self, cached_frame, self.compare_in(false)),
@@ -1022,14 +1022,6 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
                         catch_sync!(self, cached_frame, e);
                     }
                 }
-                Opcode::DeleteSubscr => {
-                    // TODO: Implement py_delitem on Value
-                    let index = self.pop();
-                    let obj = self.pop();
-                    obj.drop_with_heap(self.heap);
-                    index.drop_with_heap(self.heap);
-                    todo!("DeleteSubscr: py_delitem not yet implemented")
-                }
                 Opcode::LoadAttr => {
                     let name_idx = fetch_u16!(cached_frame);
                     let name_id = StringId::from_index(name_idx);
@@ -1044,9 +1036,6 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
                     let name_idx = fetch_u16!(cached_frame);
                     let name_id = StringId::from_index(name_idx);
                     try_catch_sync!(self, cached_frame, self.store_attr(name_id));
-                }
-                Opcode::DeleteAttr => {
-                    todo!("DeleteAttr not implemented")
                 }
                 // Control Flow - use cached_frame.ip directly for jumps
                 Opcode::Jump => {
@@ -1288,9 +1277,6 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
                     let exc = self.pop();
                     let error = self.make_exception(exc, true); // is_raise=true, hide caret
                     catch_sync!(self, cached_frame, error);
-                }
-                Opcode::RaiseFrom => {
-                    todo!("RaiseFrom")
                 }
                 Opcode::Reraise => {
                     // Pop the current exception from the stack to re-raise it

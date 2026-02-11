@@ -16,6 +16,149 @@ use crate::{
 /// the allocation check can catch them.
 pub const LARGE_RESULT_THRESHOLD: usize = 100_000;
 
+/// Pre-checks that a sequence repeat won't exceed resource limits before allocating.
+///
+/// This prevents DoS via expressions like `'x' * 999_999_999` or `b'ab' * huge_int`
+/// by estimating the result size and checking against the resource tracker.
+pub fn check_repeat_size(item_len: usize, count: usize, tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+    check_estimated_size(item_len.saturating_mul(count), tracker)
+}
+
+/// Pre-checks that `base ** exponent` won't exceed resource limits before computing.
+///
+/// The result of `base ** exp` has approximately `base_bits * exp` bits.
+/// For bases with 0 or 1 significant bits (0, 1, -1), the result is always
+/// small regardless of exponent, so the check is skipped.
+pub fn check_pow_size(base_bits: u64, exponent: u64, tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+    // 0**n = 0, 1**n = 1, (-1)**n = ±1 — always small
+    if base_bits <= 1 {
+        return Ok(());
+    }
+    check_estimated_size(estimate_bits_to_bytes(base_bits.saturating_mul(exponent)), tracker)
+}
+
+/// Pre-checks that an integer multiplication won't exceed resource limits.
+///
+/// The result of multiplying two numbers has at most `a_bits + b_bits` bits.
+pub fn check_mult_size(a_bits: u64, b_bits: u64, tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+    check_estimated_size(estimate_bits_to_bytes(a_bits.saturating_add(b_bits)), tracker)
+}
+
+/// Pre-checks that a left shift won't exceed resource limits.
+///
+/// The result of `value << shift` has approximately `value_bits + shift` bits.
+/// For zero values the result is always zero, so the check is skipped.
+pub fn check_lshift_size(
+    value_bits: u64,
+    shift_amount: u64,
+    tracker: &impl ResourceTracker,
+) -> Result<(), ResourceError> {
+    if value_bits == 0 {
+        return Ok(());
+    }
+    check_estimated_size(estimate_bits_to_bytes(value_bits.saturating_add(shift_amount)), tracker)
+}
+
+/// Checks an estimated result size against the resource tracker.
+///
+/// Only calls the tracker when the estimate exceeds `LARGE_RESULT_THRESHOLD`
+/// to avoid overhead on small operations.
+fn check_estimated_size(estimated_bytes: usize, tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+    if estimated_bytes > LARGE_RESULT_THRESHOLD {
+        tracker.check_large_result(estimated_bytes)?;
+    }
+    Ok(())
+}
+
+/// Converts an estimated bit count to bytes, saturating to `usize::MAX` on overflow.
+///
+/// Overflow means the result is astronomically large, so saturating ensures
+/// the resource limit check always triggers rather than being silently skipped.
+fn estimate_bits_to_bytes(bits: u64) -> usize {
+    usize::try_from(bits.saturating_add(7) / 8).unwrap_or(usize::MAX)
+}
+
+/// Maximum recursion depth for data structure operations (repr, eq, hash, etc.).
+///
+/// Separate from the function call stack limit. This protects against stack overflow
+/// when traversing deeply nested structures.
+///
+/// Lower in debug mode to avoid stack overflow (debug builds use more stack space
+/// per call frame).
+#[cfg(debug_assertions)]
+pub const MAX_DATA_RECURSION_DEPTH: u16 = 100;
+
+/// Maximum recursion depth for data structure operations (repr, eq, hash, etc.).
+///
+/// Separate from the function call stack limit. This protects against stack overflow
+/// when traversing deeply nested structures.
+#[cfg(not(debug_assertions))]
+pub const MAX_DATA_RECURSION_DEPTH: u16 = 500;
+
+/// Tracks recursion depth for container operations (repr, eq, cmp, hash).
+///
+/// The guard tracks remaining depth rather than current depth, making the
+/// check a simple decrement-and-check operation.
+#[derive(Debug, Clone)]
+pub struct DepthGuard {
+    /// Remaining depth before limit is exceeded.
+    depth_remaining: u16,
+}
+
+impl DepthGuard {
+    /// Increases recursion depth, returning `true` if within limits, `false` if exceeded.
+    ///
+    /// When this returns `true`, you MUST call `decrease()` on every return path.
+    /// When it returns `false`, the depth was not incremented, so `decrease()` must NOT be called.
+    ///
+    /// Use this in contexts like `py_repr_fmt` where exceeding the limit should
+    /// produce a truncated representation (e.g. `...`) rather than an error.
+    #[inline]
+    pub fn increase(&mut self) -> bool {
+        if let Some(decr) = self.depth_remaining.checked_sub(1) {
+            self.depth_remaining = decr;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Increases recursion depth, returning `Err(ResourceError::Recursion)` if
+    /// the limit is exceeded.
+    ///
+    /// MUST call `decrease()` on every return path after a successful call.
+    /// For complex control flow with multiple exit points, use the `*_inner` pattern
+    /// where the outer function handles `increase_err()/decrease()` and delegates to
+    /// an inner function for the actual implementation.
+    #[inline]
+    pub fn increase_err(&mut self) -> Result<(), ResourceError> {
+        if self.increase() {
+            Ok(())
+        } else {
+            Err(ResourceError::Recursion {
+                limit: MAX_DATA_RECURSION_DEPTH as usize,
+                depth: MAX_DATA_RECURSION_DEPTH as usize + 1,
+            })
+        }
+    }
+
+    /// Decreases recursion depth (must be called after a successful `increase()` or `increase_err()`).
+    ///
+    /// This restores the guard's remaining depth after exiting a level of recursion.
+    #[inline]
+    pub fn decrease(&mut self) {
+        self.depth_remaining += 1;
+    }
+}
+
+impl Default for DepthGuard {
+    fn default() -> Self {
+        Self {
+            depth_remaining: MAX_DATA_RECURSION_DEPTH,
+        }
+    }
+}
+
 /// Error returned when a resource limit is exceeded during execution.
 ///
 /// This allows the sandbox to enforce strict limits on allocation count,

@@ -20,7 +20,7 @@ use crate::{
     heap::{Heap, HeapData, HeapId},
     intern::{BytesId, ExtFunctionId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
     modules::ModuleFunctions,
-    resource::{LARGE_RESULT_THRESHOLD, ResourceTracker},
+    resource::{DepthGuard, ResourceError, ResourceTracker, check_lshift_size, check_pow_size, check_repeat_size},
     types::{
         AttrCallResult, LongInt, Property, PyTrait, Str, Type,
         bytes::{bytes_repr_fmt, get_byte_at_index, get_bytes_slice},
@@ -154,121 +154,138 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        guard: &mut DepthGuard,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         match (self, other) {
-            (Self::Undefined, _) => false,
-            (_, Self::Undefined) => false,
-            (Self::Int(v1), Self::Int(v2)) => v1 == v2,
-            (Self::Bool(v1), Self::Bool(v2)) => v1 == v2,
-            (Self::Bool(v1), Self::Int(v2)) => i64::from(*v1) == *v2,
-            (Self::Int(v1), Self::Bool(v2)) => *v1 == i64::from(*v2),
-            (Self::Float(v1), Self::Float(v2)) => v1 == v2,
-            (Self::Int(v1), Self::Float(v2)) => (*v1 as f64) == *v2,
-            (Self::Float(v1), Self::Int(v2)) => *v1 == (*v2 as f64),
-            (Self::Bool(v1), Self::Float(v2)) => (i64::from(*v1) as f64) == *v2,
-            (Self::Float(v1), Self::Bool(v2)) => *v1 == (i64::from(*v2) as f64),
-            (Self::None, Self::None) => true,
+            (Self::Undefined, _) => Ok(false),
+            (_, Self::Undefined) => Ok(false),
+            (Self::Int(v1), Self::Int(v2)) => Ok(v1 == v2),
+            (Self::Bool(v1), Self::Bool(v2)) => Ok(v1 == v2),
+            (Self::Bool(v1), Self::Int(v2)) => Ok(i64::from(*v1) == *v2),
+            (Self::Int(v1), Self::Bool(v2)) => Ok(*v1 == i64::from(*v2)),
+            (Self::Float(v1), Self::Float(v2)) => Ok(v1 == v2),
+            (Self::Int(v1), Self::Float(v2)) => Ok((*v1 as f64) == *v2),
+            (Self::Float(v1), Self::Int(v2)) => Ok(*v1 == (*v2 as f64)),
+            (Self::Bool(v1), Self::Float(v2)) => Ok((i64::from(*v1) as f64) == *v2),
+            (Self::Float(v1), Self::Bool(v2)) => Ok(*v1 == (i64::from(*v2) as f64)),
+            (Self::None, Self::None) => Ok(true),
 
             // Int == LongInt comparison
             (Self::Int(a), Self::Ref(id)) => {
                 if let HeapData::LongInt(li) = heap.get(*id) {
-                    BigInt::from(*a) == *li.inner()
+                    Ok(BigInt::from(*a) == *li.inner())
                 } else {
-                    false
+                    Ok(false)
                 }
             }
             // LongInt == Int comparison
             (Self::Ref(id), Self::Int(b)) => {
                 if let HeapData::LongInt(li) = heap.get(*id) {
-                    *li.inner() == BigInt::from(*b)
+                    Ok(*li.inner() == BigInt::from(*b))
                 } else {
-                    false
+                    Ok(false)
                 }
             }
 
             // For interned interns, compare by StringId first (fast path for same interned string)
-            (Self::InternString(s1), Self::InternString(s2)) => s1 == s2,
+            (Self::InternString(s1), Self::InternString(s2)) => Ok(s1 == s2),
             // for strings we need to account for the fact they might be either interned or not
             (Self::InternString(string_id), Self::Ref(id2)) => {
                 if let HeapData::Str(s2) = heap.get(*id2) {
-                    interns.get_str(*string_id) == s2.as_str()
+                    Ok(interns.get_str(*string_id) == s2.as_str())
                 } else {
-                    false
+                    Ok(false)
                 }
             }
             (Self::Ref(id1), Self::InternString(string_id)) => {
                 if let HeapData::Str(s1) = heap.get(*id1) {
-                    s1.as_str() == interns.get_str(*string_id)
+                    Ok(s1.as_str() == interns.get_str(*string_id))
                 } else {
-                    false
+                    Ok(false)
                 }
             }
 
             // For interned bytes, compare by content (bytes are not deduplicated unlike interns)
             (Self::InternBytes(b1), Self::InternBytes(b2)) => {
                 // Fast path: same BytesId means same content
-                b1 == b2 || interns.get_bytes(*b1) == interns.get_bytes(*b2)
+                Ok(b1 == b2 || interns.get_bytes(*b1) == interns.get_bytes(*b2))
             }
             // same for bytes
             (Self::InternBytes(bytes_id), Self::Ref(id2)) => {
                 if let HeapData::Bytes(b2) = heap.get(*id2) {
-                    interns.get_bytes(*bytes_id) == b2.as_slice()
+                    Ok(interns.get_bytes(*bytes_id) == b2.as_slice())
                 } else {
-                    false
+                    Ok(false)
                 }
             }
             (Self::Ref(id1), Self::InternBytes(bytes_id)) => {
                 if let HeapData::Bytes(b1) = heap.get(*id1) {
-                    b1.as_slice() == interns.get_bytes(*bytes_id)
+                    Ok(b1.as_slice() == interns.get_bytes(*bytes_id))
                 } else {
-                    false
+                    Ok(false)
                 }
             }
 
             (Self::Ref(id1), Self::Ref(id2)) => {
                 if *id1 == *id2 {
-                    return true;
+                    return Ok(true);
                 }
                 // Need to use with_two for proper borrow management
-                heap.with_two(*id1, *id2, |heap, left, right| left.py_eq(right, heap, interns))
+                heap.with_two(*id1, *id2, |heap, left, right| left.py_eq(right, heap, guard, interns))
             }
 
             // Builtins equality - just check the enums are equal
-            (Self::Builtin(b1), Self::Builtin(b2)) => b1 == b2,
+            (Self::Builtin(b1), Self::Builtin(b2)) => Ok(b1 == b2),
             // Module functions equality
-            (Self::ModuleFunction(mf1), Self::ModuleFunction(mf2)) => mf1 == mf2,
-            (Self::DefFunction(f1), Self::DefFunction(f2)) => f1 == f2,
+            (Self::ModuleFunction(mf1), Self::ModuleFunction(mf2)) => Ok(mf1 == mf2),
+            (Self::DefFunction(f1), Self::DefFunction(f2)) => Ok(f1 == f2),
             // Markers compare equal if they're the same variant
-            (Self::Marker(m1), Self::Marker(m2)) => m1 == m2,
+            (Self::Marker(m1), Self::Marker(m2)) => Ok(m1 == m2),
             // Properties compare equal if they're the same variant
-            (Self::Property(p1), Self::Property(p2)) => p1 == p2,
+            (Self::Property(p1), Self::Property(p2)) => Ok(p1 == p2),
 
-            _ => false,
+            _ => Ok(false),
         }
     }
 
-    fn py_cmp(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Option<Ordering> {
+    fn py_cmp(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        guard: &mut DepthGuard,
+        interns: &Interns,
+    ) -> Result<Option<Ordering>, ResourceError> {
+        // py_cmp currently only handles non-recursive types (numbers, strings, bytes)
+        // so we don't need to recurse through the guard. The guard parameter exists
+        // for API consistency with py_eq.
         match (self, other) {
-            (Self::Int(s), Self::Int(o)) => s.partial_cmp(o),
-            (Self::Float(s), Self::Float(o)) => s.partial_cmp(o),
-            (Self::Int(s), Self::Float(o)) => (*s as f64).partial_cmp(o),
-            (Self::Float(s), Self::Int(o)) => s.partial_cmp(&(*o as f64)),
-            (Self::Bool(s), _) => Self::Int(i64::from(*s)).py_cmp(other, heap, interns),
-            (_, Self::Bool(s)) => self.py_cmp(&Self::Int(i64::from(*s)), heap, interns),
+            (Self::Int(s), Self::Int(o)) => Ok(s.partial_cmp(o)),
+            (Self::Float(s), Self::Float(o)) => Ok(s.partial_cmp(o)),
+            (Self::Int(s), Self::Float(o)) => Ok((*s as f64).partial_cmp(o)),
+            (Self::Float(s), Self::Int(o)) => Ok(s.partial_cmp(&(*o as f64))),
+            // Bool promotion: convert to Int and re-dispatch. Recursion is bounded
+            // to at most 2 levels (Bool→Int, then Int matches directly above).
+            (Self::Bool(s), _) => Self::Int(i64::from(*s)).py_cmp(other, heap, guard, interns),
+            (_, Self::Bool(s)) => self.py_cmp(&Self::Int(i64::from(*s)), heap, guard, interns),
             // Int vs LongInt comparison
             (Self::Int(a), Self::Ref(id)) => {
                 if let HeapData::LongInt(li) = heap.get(*id) {
-                    BigInt::from(*a).partial_cmp(li.inner())
+                    Ok(BigInt::from(*a).partial_cmp(li.inner()))
                 } else {
-                    None
+                    Ok(None)
                 }
             }
             // LongInt vs Int comparison
             (Self::Ref(id), Self::Int(b)) => {
                 if let HeapData::LongInt(li) = heap.get(*id) {
-                    li.inner().partial_cmp(&BigInt::from(*b))
+                    Ok(li.inner().partial_cmp(&BigInt::from(*b)))
                 } else {
-                    None
+                    Ok(None)
                 }
             }
             // LongInt vs LongInt comparison
@@ -276,22 +293,24 @@ impl PyTrait for Value {
                 let is_longint1 = matches!(heap.get(*id1), HeapData::LongInt(_));
                 let is_longint2 = matches!(heap.get(*id2), HeapData::LongInt(_));
                 if is_longint1 && is_longint2 {
-                    heap.with_two(*id1, *id2, |_heap, left, right| {
+                    Ok(heap.with_two(*id1, *id2, |_heap, left, right| {
                         if let (HeapData::LongInt(a), HeapData::LongInt(b)) = (left, right) {
                             a.inner().partial_cmp(b.inner())
                         } else {
                             None
                         }
-                    })
+                    }))
                 } else {
-                    None
+                    Ok(None)
                 }
             }
-            (Self::InternString(s1), Self::InternString(s2)) => interns.get_str(*s1).partial_cmp(interns.get_str(*s2)),
-            (Self::InternBytes(b1), Self::InternBytes(b2)) => {
-                interns.get_bytes(*b1).partial_cmp(interns.get_bytes(*b2))
+            (Self::InternString(s1), Self::InternString(s2)) => {
+                Ok(interns.get_str(*s1).partial_cmp(interns.get_str(*s2)))
             }
-            _ => None,
+            (Self::InternBytes(b1), Self::InternBytes(b2)) => {
+                Ok(interns.get_bytes(*b1).partial_cmp(interns.get_bytes(*b2)))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -332,6 +351,7 @@ impl PyTrait for Value {
         f: &mut impl Write,
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
+        guard: &mut DepthGuard,
         interns: &Interns,
     ) -> std::fmt::Result {
         match self {
@@ -373,7 +393,7 @@ impl PyTrait for Value {
                     }
                 } else {
                     heap_ids.insert(*id);
-                    let result = heap.get(*id).py_repr_fmt(f, heap, heap_ids, interns);
+                    let result = heap.get(*id).py_repr_fmt(f, heap, heap_ids, guard, interns);
                     heap_ids.remove(id);
                     result
                 }
@@ -383,11 +403,16 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Cow<'static, str> {
+    fn py_str(
+        &self,
+        heap: &Heap<impl ResourceTracker>,
+        guard: &mut DepthGuard,
+        interns: &Interns,
+    ) -> Cow<'static, str> {
         match self {
             Self::InternString(string_id) => interns.get_str(*string_id).to_owned().into(),
-            Self::Ref(id) => heap.get(*id).py_str(heap, interns),
-            _ => self.py_repr(heap, interns),
+            Self::Ref(id) => heap.get(*id).py_str(heap, guard, interns),
+            _ => self.py_repr(heap, guard, interns),
         }
     }
 
@@ -774,94 +799,12 @@ impl PyTrait for Value {
                     Ok(Some(li.into_value(heap)?))
                 }
             }
-            // Int * LongInt
-            (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
-                    // Check size before computing to prevent DoS
-                    let a_bits = i64_bits(*a);
-                    let b_bits = li.bits();
-                    if let Some(estimated) = LongInt::estimate_mult_bytes(a_bits, b_bits)
-                        && estimated > LARGE_RESULT_THRESHOLD
-                    {
-                        heap.tracker().check_large_result(estimated)?;
-                    }
-                    let result = LongInt::from(*a) * LongInt::new(li.inner().clone());
-                    Ok(Some(result.into_value(heap)?))
-                } else {
-                    // Check for sequence repetition
-                    let count = i64_to_repeat_count(*a)?;
-                    heap.mult_sequence(*id, count)
-                }
-            }
-            // LongInt * Int
-            (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
-                    // Check size before computing to prevent DoS
-                    let a_bits = li.bits();
-                    let b_bits = i64_bits(*b);
-                    if let Some(estimated) = LongInt::estimate_mult_bytes(a_bits, b_bits)
-                        && estimated > LARGE_RESULT_THRESHOLD
-                    {
-                        heap.tracker().check_large_result(estimated)?;
-                    }
-                    let result = LongInt::new(li.inner().clone()) * LongInt::from(*b);
-                    Ok(Some(result.into_value(heap)?))
-                } else {
-                    // Check for sequence repetition
-                    let count = i64_to_repeat_count(*b)?;
-                    heap.mult_sequence(*id, count)
-                }
-            }
-            // LongInt * LongInt or sequence * LongInt
-            (Self::Ref(id1), Self::Ref(id2)) => {
-                let is_longint1 = matches!(heap.get(*id1), HeapData::LongInt(_));
-                let is_longint2 = matches!(heap.get(*id2), HeapData::LongInt(_));
-                if is_longint1 && is_longint2 {
-                    // LongInt * LongInt - get bits for size check
-                    let a_bits = if let HeapData::LongInt(li) = heap.get(*id1) {
-                        li.bits()
-                    } else {
-                        0
-                    };
-                    let b_bits = if let HeapData::LongInt(li) = heap.get(*id2) {
-                        li.bits()
-                    } else {
-                        0
-                    };
-                    // Check size before computing to prevent DoS
-                    if let Some(estimated) = LongInt::estimate_mult_bytes(a_bits, b_bits)
-                        && estimated > LARGE_RESULT_THRESHOLD
-                    {
-                        heap.tracker().check_large_result(estimated)?;
-                    }
-                    Ok(heap.with_two(*id1, *id2, |heap, left, right| {
-                        if let (HeapData::LongInt(a), HeapData::LongInt(b)) = (left, right) {
-                            let result = LongInt::new(a.inner() * b.inner());
-                            result.into_value(heap).map(Some)
-                        } else {
-                            Ok(None)
-                        }
-                    })?)
-                } else if is_longint2 {
-                    // sequence * LongInt - get the repeat count from LongInt
-                    let count = if let HeapData::LongInt(li) = heap.get(*id2) {
-                        longint_to_repeat_count(li)?
-                    } else {
-                        return Ok(None);
-                    };
-                    heap.mult_sequence(*id1, count)
-                } else if is_longint1 {
-                    // LongInt * sequence - get the repeat count from LongInt
-                    let count = if let HeapData::LongInt(li) = heap.get(*id1) {
-                        longint_to_repeat_count(li)?
-                    } else {
-                        return Ok(None);
-                    };
-                    heap.mult_sequence(*id2, count)
-                } else {
-                    Ok(None)
-                }
-            }
+            // Int * Ref (LongInt or sequence)
+            (Self::Int(a), Self::Ref(id)) => heap.mult_ref_by_i64(*id, *a),
+            // Ref * Int (LongInt or sequence)
+            (Self::Ref(id), Self::Int(b)) => heap.mult_ref_by_i64(*id, *b),
+            // Ref * Ref (LongInt * LongInt, sequence * LongInt, etc.)
+            (Self::Ref(id1), Self::Ref(id2)) => heap.mult_heap_values(*id1, *id2),
             (Self::Float(a), Self::Float(b)) => Ok(Some(Self::Float(a * b))),
             (Self::Int(a), Self::Float(b)) => Ok(Some(Self::Float(*a as f64 * b))),
             (Self::Float(a), Self::Int(b)) => Ok(Some(Self::Float(a * *b as f64))),
@@ -891,14 +834,18 @@ impl PyTrait for Value {
             // String repetition: "ab" * 3 or 3 * "ab"
             (Self::InternString(s), Self::Int(n)) | (Self::Int(n), Self::InternString(s)) => {
                 let count = i64_to_repeat_count(*n)?;
-                let result = interns.get_str(*s).repeat(count);
+                let str_ref = interns.get_str(*s);
+                check_repeat_size(str_ref.len(), count, heap.tracker())?;
+                let result = str_ref.repeat(count);
                 Ok(Some(Self::Ref(heap.allocate(HeapData::Str(result.into()))?)))
             }
 
             // Bytes repetition: b"ab" * 3 or 3 * b"ab"
             (Self::InternBytes(b), Self::Int(n)) | (Self::Int(n), Self::InternBytes(b)) => {
                 let count = i64_to_repeat_count(*n)?;
-                let result: Vec<u8> = interns.get_bytes(*b).repeat(count);
+                let bytes_ref = interns.get_bytes(*b);
+                check_repeat_size(bytes_ref.len(), count, heap.tracker())?;
+                let result: Vec<u8> = bytes_ref.repeat(count);
                 Ok(Some(Self::Ref(heap.allocate(HeapData::Bytes(result.into()))?)))
             }
 
@@ -906,7 +853,9 @@ impl PyTrait for Value {
             (Self::InternString(s), Self::Ref(id)) | (Self::Ref(id), Self::InternString(s)) => {
                 if let HeapData::LongInt(li) = heap.get(*id) {
                     let count = longint_to_repeat_count(li)?;
-                    let result = interns.get_str(*s).repeat(count);
+                    let str_ref = interns.get_str(*s);
+                    check_repeat_size(str_ref.len(), count, heap.tracker())?;
+                    let result = str_ref.repeat(count);
                     Ok(Some(Self::Ref(heap.allocate(HeapData::Str(result.into()))?)))
                 } else {
                     Ok(None)
@@ -917,7 +866,9 @@ impl PyTrait for Value {
             (Self::InternBytes(b), Self::Ref(id)) | (Self::Ref(id), Self::InternBytes(b)) => {
                 if let HeapData::LongInt(li) = heap.get(*id) {
                     let count = longint_to_repeat_count(li)?;
-                    let result: Vec<u8> = interns.get_bytes(*b).repeat(count);
+                    let bytes_ref = interns.get_bytes(*b);
+                    check_repeat_size(bytes_ref.len(), count, heap.tracker())?;
+                    let result: Vec<u8> = bytes_ref.repeat(count);
                     Ok(Some(Self::Ref(heap.allocate(HeapData::Bytes(result.into()))?)))
                 } else {
                     Ok(None)
@@ -1235,7 +1186,7 @@ impl PyTrait for Value {
                         } else {
                             // Overflow - promote to LongInt
                             // Check size before computing to prevent DoS
-                            check_pow_size(i64_bits(*base), u64::from(exp_u32), heap)?;
+                            check_pow_size(i64_bits(*base), u64::from(exp_u32), heap.tracker())?;
                             let bi = BigInt::from(*base).pow(exp_u32);
                             Ok(Some(LongInt::new(bi).into_value(heap)?))
                         }
@@ -1246,7 +1197,7 @@ impl PyTrait for Value {
                         #[expect(clippy::cast_sign_loss)]
                         let exp_u64 = *exp as u64;
                         // Check size before computing to prevent DoS
-                        check_pow_size(i64_bits(*base), exp_u64, heap)?;
+                        check_pow_size(i64_bits(*base), exp_u64, heap.tracker())?;
                         let bi = bigint_pow(BigInt::from(*base), exp_u64);
                         Ok(Some(LongInt::new(bi).into_value(heap)?))
                     }
@@ -1269,7 +1220,7 @@ impl PyTrait for Value {
                         // Use BigInt pow for positive exponents
                         if let Ok(exp_u32) = u32::try_from(*exp) {
                             // Check size before computing to prevent DoS
-                            check_pow_size(li.bits(), u64::from(exp_u32), heap)?;
+                            check_pow_size(li.bits(), u64::from(exp_u32), heap.tracker())?;
                             let bi = li.inner().pow(exp_u32);
                             Ok(Some(LongInt::new(bi).into_value(heap)?))
                         } else {
@@ -1277,7 +1228,7 @@ impl PyTrait for Value {
                             #[expect(clippy::cast_sign_loss)]
                             let exp_u64 = *exp as u64;
                             // Check size before computing to prevent DoS
-                            check_pow_size(li.bits(), exp_u64, heap)?;
+                            check_pow_size(li.bits(), exp_u64, heap.tracker())?;
                             let bi = bigint_pow(li.inner().clone(), exp_u64);
                             Ok(Some(LongInt::new(bi).into_value(heap)?))
                         }
@@ -1322,7 +1273,7 @@ impl PyTrait for Value {
                                 Ok(Some(Self::Int(result)))
                             } else {
                                 // Check size before computing to prevent DoS
-                                check_pow_size(i64_bits(*base), u64::from(exp_u32), heap)?;
+                                check_pow_size(i64_bits(*base), u64::from(exp_u32), heap.tracker())?;
                                 let bi = BigInt::from(*base).pow(exp_u32);
                                 Ok(Some(LongInt::new(bi).into_value(heap)?))
                             }
@@ -1680,8 +1631,24 @@ impl Value {
                 // This allows iterating over container elements while calling py_eq
                 // (which needs &mut Heap for comparing nested heap values).
                 heap.with_entry_mut(*heap_id, |heap, data| match data {
-                    HeapData::List(el) => Ok(el.as_vec().iter().any(|i| item.py_eq(i, heap, interns))),
-                    HeapData::Tuple(el) => Ok(el.as_vec().iter().any(|i| item.py_eq(i, heap, interns))),
+                    HeapData::List(list) => {
+                        let mut guard = DepthGuard::default();
+                        for el in list.as_slice() {
+                            if item.py_eq(el, heap, &mut guard, interns)? {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(false)
+                    }
+                    HeapData::Tuple(tuple) => {
+                        let mut guard = DepthGuard::default();
+                        for el in tuple.as_slice() {
+                            if item.py_eq(el, heap, &mut guard, interns)? {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(false)
+                    }
                     HeapData::Dict(dict) => dict.get(item, heap, interns).map(|m| m.is_some()),
                     HeapData::Set(set) => set.contains(item, heap, interns),
                     HeapData::FrozenSet(fset) => fset.contains(item, heap, interns),
@@ -1908,14 +1875,7 @@ impl Value {
                         #[expect(clippy::cast_sign_loss)]
                         let shift_u64 = shift as u64;
                         // Check size before computing to prevent DoS
-                        // Skip check if value is 0 - result is always 0 regardless of shift
-                        let value_bits = l.bits();
-                        if value_bits > 0
-                            && let Some(estimated) = LongInt::estimate_lshift_bytes(value_bits, shift_u64)
-                            && estimated > LARGE_RESULT_THRESHOLD
-                        {
-                            heap.tracker().check_large_result(estimated)?;
-                        }
+                        check_lshift_size(l.bits(), shift_u64, heap.tracker())?;
                         l << shift_u64
                     } else if r.sign() == num_bigint::Sign::Minus {
                         return Err(ExcType::value_error_negative_shift_count());
@@ -2472,27 +2432,6 @@ fn i64_bits(value: i64) -> u64 {
         // For negative numbers, use unsigned_abs to get magnitude
         u64::from(64 - value.unsigned_abs().leading_zeros())
     }
-}
-
-/// Checks if a pow operation result would exceed the large result threshold.
-///
-/// If the estimated result is larger than `LARGE_RESULT_THRESHOLD`, calls
-/// `heap.tracker().check_large_result()` to allow the tracker to reject the operation.
-/// Returns `Ok(())` if the operation should proceed, or an error to reject.
-fn check_pow_size(base_bits: u64, exp: u64, heap: &Heap<impl ResourceTracker>) -> Result<(), RunError> {
-    // Special case: 0 or 1 bit bases can't produce large results worth checking
-    // (0**n = 0, 1**n = 1, -1**n = ±1)
-    if base_bits <= 1 {
-        return Ok(());
-    }
-
-    if let Some(estimated) = LongInt::estimate_pow_bytes(base_bits, exp)
-        && estimated > LARGE_RESULT_THRESHOLD
-    {
-        heap.tracker().check_large_result(estimated)?;
-    }
-    // If estimate overflows, proceed anyway - into_value will catch it during allocation
-    Ok(())
 }
 
 /// Computes BigInt exponentiation for exponents larger than u32::MAX.

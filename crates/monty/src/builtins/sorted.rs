@@ -4,10 +4,11 @@ use std::cmp::Ordering;
 
 use crate::{
     args::ArgValues,
+    defer_drop_mut,
     exception_private::{ExcType, RunResult, SimpleException},
     heap::{Heap, HeapData},
     intern::Interns,
-    resource::ResourceTracker,
+    resource::{DepthGuard, ResourceTracker},
     types::{List, MontyIter, PyTrait},
     value::Value,
 };
@@ -17,21 +18,10 @@ use crate::{
 /// Returns a new sorted list from the items in an iterable.
 /// Note: Currently does not support key or reverse arguments.
 pub fn builtin_sorted(heap: &mut Heap<impl ResourceTracker>, args: ArgValues, interns: &Interns) -> RunResult<Value> {
-    let (mut positional, kwargs) = args.into_parts();
+    let (positional, kwargs) = args.into_parts();
+    defer_drop_mut!(positional, heap);
 
-    // Check for unsupported kwargs
-    if !kwargs.is_empty() {
-        for (k, v) in kwargs {
-            k.drop_with_heap(heap);
-            v.drop_with_heap(heap);
-        }
-        for v in positional {
-            v.drop_with_heap(heap);
-        }
-        return Err(
-            SimpleException::new_msg(ExcType::TypeError, "sorted() does not support keyword arguments yet").into(),
-        );
-    }
+    kwargs.not_supported_yet("sorted", heap)?;
 
     let positional_len = positional.len();
     if positional_len != 1 {
@@ -52,10 +42,11 @@ pub fn builtin_sorted(heap: &mut Heap<impl ResourceTracker>, args: ArgValues, in
 
     // Sort using insertion sort (simple, stable, works with py_cmp)
     // For small lists this is fine; for large lists we'd want a better algorithm
+    let mut guard = DepthGuard::default();
     for i in 1..items.len() {
         let mut j = i;
         while j > 0 {
-            match items[j - 1].py_cmp(&items[j], heap, interns) {
+            match items[j - 1].py_cmp(&items[j], heap, &mut guard, interns)? {
                 Some(Ordering::Greater) => {
                     items.swap(j - 1, j);
                     j -= 1;

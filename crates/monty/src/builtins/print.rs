@@ -2,11 +2,12 @@
 
 use crate::{
     args::{ArgValues, KwargsValues},
+    defer_drop,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
     heap::{Heap, HeapData},
     intern::Interns,
     io::PrintWriter,
-    resource::ResourceTracker,
+    resource::{DepthGuard, ResourceTracker},
     types::PyTrait,
     value::Value,
 };
@@ -27,21 +28,15 @@ pub fn builtin_print(
 ) -> RunResult<Value> {
     // Split into positional args and kwargs
     let (positional, kwargs) = args.into_parts();
+    defer_drop!(positional, heap);
 
-    // Extract kwargs first, consuming them - this handles cleanup on error
-    let (sep, end) = match extract_print_kwargs(kwargs, heap, interns) {
-        Ok(se) => se,
-        Err(err) => {
-            for value in positional {
-                value.drop_with_heap(heap);
-            }
-            return Err(err);
-        }
-    };
+    // Extract kwargs first
+    let (sep, end) = extract_print_kwargs(kwargs, heap, interns)?;
 
     // Print positional args with separator, dropping each value after use
     let mut first = true;
-    for value in positional {
+    let mut guard = DepthGuard::default();
+    for value in positional.as_slice() {
         if first {
             first = false;
         } else if let Some(sep) = &sep {
@@ -49,8 +44,7 @@ pub fn builtin_print(
         } else {
             print.stdout_push(' ')?;
         }
-        print.stdout_write(value.py_str(heap, interns))?;
-        value.drop_with_heap(heap);
+        print.stdout_write(value.py_str(heap, &mut guard, interns))?;
     }
 
     // Append end string

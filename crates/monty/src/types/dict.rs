@@ -11,10 +11,11 @@ use smallvec::smallvec;
 use super::{List, MontyIter, PyTrait, allocate_tuple};
 use crate::{
     args::{ArgValues, KwargsValues},
+    defer_drop_mut,
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings},
-    resource::ResourceTracker,
+    resource::{DepthGuard, ResourceError, ResourceTracker},
     types::Type,
     value::{EitherStr, Value},
 };
@@ -297,9 +298,14 @@ impl Dict {
             .py_hash(heap, interns)
             .ok_or_else(|| ExcType::type_error_unhashable_dict_key(key.py_type(heap)))?;
 
+        // Create a guard for key equality comparisons.
+        let mut guard = DepthGuard::default();
         let entry = self.indices.entry(
             hash,
-            |v| key.py_eq(&self.entries[*v].key, heap, interns),
+            |v| {
+                key.py_eq(&self.entries[*v].key, heap, &mut guard, interns)
+                    .unwrap_or(false)
+            },
             |index| self.entries[*index].hash,
         );
 
@@ -437,9 +443,17 @@ impl Dict {
             .py_hash(heap, interns)
             .ok_or_else(|| ExcType::type_error_unhashable_dict_key(key.py_type(heap)))?;
 
+        // Create a guard for key equality comparisons. Dict keys are typically
+        // shallow (strings, ints, tuples of primitives), so recursion errors
+        // are unlikely. If one occurs, treat it as "not equal" - the key lookup
+        // fails but doesn't crash.
+        let mut guard = DepthGuard::default();
         let opt_index = self
             .indices
-            .find(hash, |v| key.py_eq(&self.entries[*v].key, heap, interns))
+            .find(hash, |v| {
+                key.py_eq(&self.entries[*v].key, heap, &mut guard, interns)
+                    .unwrap_or(false)
+            })
             .copied();
         Ok((opt_index, hash))
     }
@@ -502,23 +516,32 @@ impl PyTrait for Dict {
         Some(self.len())
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        guard: &mut DepthGuard,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         if self.len() != other.len() {
-            return false;
+            return Ok(false);
         }
 
+        guard.increase_err()?;
         // Check that all keys in self exist in other with equal values
         for entry in &self.entries {
-            match other.get(&entry.key, heap, interns) {
-                Ok(Some(other_v)) => {
-                    if !entry.value.py_eq(other_v, heap, interns) {
-                        return false;
-                    }
+            if let Ok(Some(other_v)) = other.get(&entry.key, heap, interns) {
+                if !entry.value.py_eq(other_v, heap, guard, interns)? {
+                    guard.decrease();
+                    return Ok(false);
                 }
-                _ => return false,
+            } else {
+                guard.decrease();
+                return Ok(false);
             }
         }
-        true
+        guard.decrease();
+        Ok(true)
     }
 
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
@@ -549,10 +572,16 @@ impl PyTrait for Dict {
         f: &mut impl Write,
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
+        guard: &mut DepthGuard,
         interns: &Interns,
     ) -> std::fmt::Result {
         if self.is_empty() {
             return f.write_str("{}");
+        }
+
+        // Check depth limit before recursing
+        if !guard.increase() {
+            return f.write_str("{...}");
         }
 
         f.write_char('{')?;
@@ -562,11 +591,14 @@ impl PyTrait for Dict {
                 f.write_str(", ")?;
             }
             first = false;
-            entry.key.py_repr_fmt(f, heap, heap_ids, interns)?;
+            entry.key.py_repr_fmt(f, heap, heap_ids, guard, interns)?;
             f.write_str(": ")?;
-            entry.value.py_repr_fmt(f, heap, heap_ids, interns)?;
+            entry.value.py_repr_fmt(f, heap, heap_ids, guard, interns)?;
         }
-        f.write_char('}')
+        f.write_char('}')?;
+
+        guard.decrease();
+        Ok(())
     }
 
     fn py_getitem(&self, key: &Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Value> {
@@ -752,29 +784,20 @@ fn dict_update(
     heap: &mut Heap<impl ResourceTracker>,
     interns: &Interns,
 ) -> RunResult<Value> {
-    let (pos, kwargs) = args.into_parts();
+    let (pos_iter, kwargs) = args.into_parts();
+    defer_drop_mut!(pos_iter, heap);
 
-    let mut pos_iter = pos;
-    let other = pos_iter.next();
-
-    // Check no extra positional arguments
-    if let Some(extra) = pos_iter.next() {
-        extra.drop_with_heap(heap);
-        for v in pos_iter {
-            v.drop_with_heap(heap);
-        }
-        if let Some(v) = other {
-            v.drop_with_heap(heap);
-        }
-        kwargs.drop_with_heap(heap);
-        return Err(ExcType::type_error_at_most("dict.update", 1, 2));
-    }
-
-    // Process positional argument if present
-    let Some(other_value) = other else {
+    let Some(other_value) = pos_iter.next() else {
         // No positional argument - just process kwargs
         return dict_update_from_kwargs(dict, kwargs, heap, interns);
     };
+
+    // Check no extra positional arguments
+    if pos_iter.len() != 0 {
+        other_value.drop_with_heap(heap);
+        kwargs.drop_with_heap(heap);
+        return Err(ExcType::type_error_at_most("dict.update", 1, 2));
+    }
 
     // Check if it's a dict first
     if let Value::Ref(id) = &other_value {

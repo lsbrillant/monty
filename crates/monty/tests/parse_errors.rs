@@ -397,3 +397,45 @@ fn deeply_nested_boolean_or_exceed_limit() {
     let result = MontyRun::new(code, "test.py", vec![], vec![]);
     assert_eq!(get_exc_type(result), ExcType::SyntaxError);
 }
+
+// === Runtime NotImplementedError tests ===
+// These test that unimplemented features return proper errors instead of panicking.
+
+/// Helper to run code and get the exception type from a runtime error.
+fn run_and_get_exc_type(code: &str) -> ExcType {
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], vec![]).expect("should parse");
+    let err = runner.run_no_limits(vec![]).expect_err("expected runtime error");
+    err.exc_type()
+}
+
+#[test]
+fn matrix_multiplication_returns_not_implemented_error() {
+    // The @ operator (matrix multiplication) is not supported at runtime
+    assert_eq!(run_and_get_exc_type("1 @ 2"), ExcType::NotImplementedError);
+}
+
+#[test]
+fn matrix_multiplication_augmented_assignment_returns_syntax_error() {
+    // The @= operator (augmented matrix multiplication) is not supported at compile time
+    let result = MontyRun::new("a = 1\na @= 2".to_owned(), "test.py", vec![], vec![]);
+    assert_eq!(get_exc_type(result), ExcType::SyntaxError);
+}
+
+#[test]
+fn matrix_multiplication_augmented_assignment_has_descriptive_message() {
+    // Verify the error message is helpful
+    let result = MontyRun::new("a = 1\na @= 2".to_owned(), "test.py", vec![], vec![]);
+    let exc = result.expect_err("expected compile error");
+    assert!(
+        exc.message().is_some_and(|m| m.contains("@=")),
+        "message should mention '@=', got: {:?}",
+        exc.message()
+    );
+}
+
+#[test]
+fn del_statement_returns_not_implemented_error() {
+    // The del statement is not supported at parse time
+    let result = MontyRun::new("x = 1\ndel x".to_owned(), "test.py", vec![], vec![]);
+    assert_eq!(get_exc_type(result), ExcType::NotImplementedError);
+}
